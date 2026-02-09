@@ -1,0 +1,56 @@
+wattnode:
+  port: /dev/ttyUSB0
+  baud: 9600
+  unit_id: 1
+  read_interval_sec: 10
+
+insight:
+  host: 192.168.86.86
+  read_port: 503
+  write_port: 502
+  min_gap_ms: 2000
+  timeout_ms: 1000
+  soc_read_interval_sec: 60
+  keepalive_sec: 60
+
+inverters:
+  master_unit_id: 10
+  slave_unit_ids: [11, 13, 12]
+  idle_order: [12, 13, 11, 10]
+
+charge:
+  start_hour: 9
+  end_hour: 15
+  start_per_inverter_w: 600
+  max_per_inverter_w: 4000
+  max_total_w: 16000
+  export_start_w: 1000
+  export_ramp_w: 1000
+  import_trim_w: 2000
+  trim_buffer_w: 500
+  hold_sec: 600
+  dead_band_export_w: 1000
+  dead_band_import_w: 2000
+
+discharge:
+  per_inverter_w: 600
+
+night_guard:
+  leg_export_threshold_w: 0
+  resume_allowed: false
+
+safety:
+  max_read_failures: 5
+
+startup:
+  zero_all_on_start: true
+
+logging:
+  level: info
+  file: /var/log/solarcontrol.log
+
+telegram:
+  bot_token: ""
+  chat_id: ""
+  poll_timeout_sec: 30
+  manual_step_w: 300
