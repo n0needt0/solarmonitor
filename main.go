@@ -54,6 +54,15 @@ func main() {
 	defer wn.Close()
 	slog.Info("connected to WattNode", "port", cfg.WattNode.Port)
 
+	// Fix WattNode config: disable Phase C, restore ConnectionType=1
+	if err := wn.WriteConfigRegister(wattnode.RegCtAmpsC, 0); err != nil {
+		slog.Warn("failed to set CtAmpsC=0", "error", err)
+	}
+	if err := wn.WriteConfigRegister(wattnode.RegConnectionType, 1); err != nil {
+		slog.Warn("failed to set ConnectionType=1", "error", err)
+	}
+	slog.Info("wattnode config applied", "ct_amps_c", 0, "connection_type", 1)
+
 	// Connect to Insight
 	ins := insight.NewClient(
 		cfg.Insight.Host,
@@ -87,7 +96,13 @@ func main() {
 		slog.Info("wattnode diag",
 			"voltage_a", diag.VoltageA,
 			"voltage_b", diag.VoltageB,
-			"scale_factor", cfg.WattNode.ScaleFactor,
+			"energy_total_kwh", diag.EnergySum,
+			"energy_a_kwh", diag.EnergyA,
+			"energy_b_kwh", diag.EnergyB,
+			"ct_amps_a", diag.CtAmpsA,
+			"ct_amps_b", diag.CtAmpsB,
+			"connection_type", diag.ConnectionType,
+			"config_regs_1602_1611", diag.ConfigRegs,
 		)
 	}
 
@@ -128,8 +143,6 @@ func main() {
 		MaxPerInvW:      cfg.Charge.MaxPerInvW,
 		MaxTotalW:       cfg.Charge.MaxTotalW,
 		ExportStartW:    cfg.Charge.ExportStartW,
-		ExportRampW:     cfg.Charge.ExportRampW,
-		ImportTrimW:     cfg.Charge.ImportTrimW,
 		TrimBufferW:     cfg.Charge.TrimBufferW,
 		HoldSec:         cfg.Charge.HoldSec,
 		DeadBandExportW: cfg.Charge.DeadBandExportW,
@@ -159,6 +172,7 @@ func main() {
 	// Create telegram handler and connect to bot
 	tgHandler := controller.NewTelegramHandler(ctrl, bot, cfg.Telegram.ManualStepW)
 	bot.SetHandler(tgHandler)
+	ctrl.SetAlerter(tgHandler)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

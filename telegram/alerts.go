@@ -31,9 +31,7 @@ type StatusData struct {
 	GridL2         float32
 	GridTotal      float32
 	Inverters      [4]InverterData
-	AvgSOC         int
 	ChargeW        int
-	DischargeW     int
 	IdledInverters []byte
 	Uptime         time.Duration
 }
@@ -66,8 +64,7 @@ func FormatStatus(d StatusData) string {
 		}
 	}
 
-	msg += fmt.Sprintf("Avg SOC: %d%%\n", d.AvgSOC)
-	msg += fmt.Sprintf("Uptime:  %s", formatDuration(d.Uptime))
+	msg += fmt.Sprintf("\nUptime:  %s", formatDuration(d.Uptime))
 
 	return msg
 }

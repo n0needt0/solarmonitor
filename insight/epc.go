@@ -22,7 +22,7 @@ const (
 
 // SetChargeMode sets an inverter to charge mode with specified power limit
 func (c *Client) SetChargeMode(unitID byte, powerW uint16) error {
-	slog.Info("set_charge_mode", "unit", unitID, "power_w", powerW)
+	slog.Debug("set_charge_mode", "unit", unitID, "power_w", powerW)
 
 	// Set charge limit first
 	if err := c.WriteRegister(unitID, RegEPCChargeMax, powerW); err != nil {
@@ -39,7 +39,7 @@ func (c *Client) SetChargeMode(unitID byte, powerW uint16) error {
 
 // SetIdleMode sets an inverter to idle (no charge/discharge)
 func (c *Client) SetIdleMode(unitID byte) error {
-	slog.Info("set_idle_mode", "unit", unitID)
+	slog.Debug("set_idle_mode", "unit", unitID)
 
 	if err := c.WriteRegister(unitID, RegEPCModeCommand, EPCModeIdle); err != nil {
 		return fmt.Errorf("set idle mode: %w", err)
@@ -50,7 +50,7 @@ func (c *Client) SetIdleMode(unitID byte) error {
 
 // SetDischargeMode sets an inverter to discharge mode with specified power limit
 func (c *Client) SetDischargeMode(unitID byte, powerW uint16) error {
-	slog.Info("set_discharge_mode", "unit", unitID, "power_w", powerW)
+	slog.Debug("set_discharge_mode", "unit", unitID, "power_w", powerW)
 
 	// Set EPC mode to discharge (2)
 	if err := c.WriteRegister(unitID, RegEPCModeCommand, EPCModeDischarge); err != nil {
@@ -67,7 +67,7 @@ func (c *Client) SetDischargeMode(unitID byte, powerW uint16) error {
 
 // SetDischargeLimit sets the maximum discharge power for an inverter
 func (c *Client) SetDischargeLimit(unitID byte, powerW uint16) error {
-	slog.Info("set_discharge_limit", "unit", unitID, "power_w", powerW)
+	slog.Debug("set_discharge_limit", "unit", unitID, "power_w", powerW)
 
 	if err := c.WriteRegister(unitID, RegEPCMaxDischarge, powerW); err != nil {
 		return fmt.Errorf("set discharge limit: %w", err)

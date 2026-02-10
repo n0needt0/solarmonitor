@@ -10,6 +10,13 @@ import (
 	"github.com/n0needt0/solarcontrol/wattnode"
 )
 
+// Alerter sends notifications on state changes
+type Alerter interface {
+	SendModeChangeAlert(state string, detail string)
+	SendFailureAlert(reason string)
+	SendRecoveryAlert(state string)
+}
+
 // Controller orchestrates the solar charge control logic
 type Controller struct {
 	cfg *Config
@@ -21,6 +28,7 @@ type Controller struct {
 	// State management
 	state     *StateManager
 	scheduler *Scheduler
+	alerter   Alerter
 
 	// Current readings
 	mu          sync.RWMutex
@@ -57,8 +65,6 @@ type Config struct {
 	MaxPerInvW      int
 	MaxTotalW       int
 	ExportStartW    int
-	ExportRampW     int
-	ImportTrimW     int
 	TrimBufferW     int
 	HoldSec         int
 	DeadBandExportW int
@@ -99,6 +105,11 @@ func New(cfg *Config, ins *insight.Client, wn *wattnode.Reader) *Controller {
 	}
 }
 
+// SetAlerter sets the notification handler for state changes
+func (c *Controller) SetAlerter(a Alerter) {
+	c.alerter = a
+}
+
 // Start begins the control loop
 func (c *Controller) Start(ctx context.Context) error {
 	slog.Info("controller starting",
@@ -122,9 +133,10 @@ func (c *Controller) Start(ctx context.Context) error {
 	}
 
 	// Start background loops
-	c.wg.Add(2)
+	c.wg.Add(3)
 	go c.gridReadLoop(ctx)
 	go c.controlLoop(ctx)
+	go c.alertLoop(ctx)
 
 	return nil
 }
@@ -296,6 +308,36 @@ func (c *Controller) sendKeepalive() {
 	}
 }
 
+// alertLoop reads state changes and sends telegram notifications
+func (c *Controller) alertLoop(ctx context.Context) {
+	defer c.wg.Done()
+
+	ch := c.state.StateChangeCh()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.stopCh:
+			return
+		case change := <-ch:
+			if c.alerter == nil {
+				continue
+			}
+			switch change.To {
+			case StateSafe:
+				c.alerter.SendFailureAlert(change.Reason)
+			default:
+				// Recovery: coming out of SAFE back to a normal state
+				if change.From == StateSafe {
+					c.alerter.SendRecoveryAlert(change.To.String())
+				} else {
+					c.alerter.SendModeChangeAlert(change.To.String(), change.Reason)
+				}
+			}
+		}
+	}
+}
+
 // readBMS reads battery status from all inverters
 func (c *Controller) readBMS() {
 	bms, err := c.insight.ReadBatteryStatus()
@@ -362,7 +404,6 @@ func (c *Controller) runControlCycle() {
 // checkTimeTransitions handles time-based state changes
 func (c *Controller) checkTimeTransitions() {
 	currentState := c.state.Current()
-	desiredState := c.scheduler.DesiredState()
 
 	// Don't override STOPPED or SAFE states
 	if currentState == StateStopped || currentState == StateSafe {
@@ -386,8 +427,6 @@ func (c *Controller) checkTimeTransitions() {
 			}
 		}
 	}
-
-	_ = desiredState // Used for logging if needed
 }
 
 // applyCurrentState sets inverter registers based on current state
@@ -488,7 +527,7 @@ func (c *Controller) startCharging() {
 	c.lastRampAt = time.Now()
 }
 
-// rampUpCharge increases charge rate based on export
+// rampUpCharge increases charge rate by taking all available export
 func (c *Controller) rampUpCharge(gridW int) {
 	// Check hold time
 	if time.Since(c.lastRampAt) < time.Duration(c.cfg.HoldSec)*time.Second {
@@ -498,38 +537,27 @@ func (c *Controller) rampUpCharge(gridW int) {
 	// Calculate export amount (gridW is negative when exporting)
 	exportW := -gridW
 
-	// Only ramp if exporting more than threshold
-	if exportW < c.cfg.ExportStartW {
-		return
+	// Take all available export: new_total = current_total + export
+	currentTotalW := c.currentChargeW * 4
+	newTotalW := currentTotalW + exportW
+	if newTotalW > c.cfg.MaxTotalW {
+		newTotalW = c.cfg.MaxTotalW
 	}
 
-	// Calculate ramp amount - proportional to excess export
-	rampW := c.cfg.ExportRampW
-	if exportW > c.cfg.ExportRampW*2 {
-		// Faster ramp for large exports
-		rampW = exportW / 2
-	}
-
-	newChargeW := c.currentChargeW + rampW
+	newChargeW := newTotalW / 4
 	if newChargeW > c.cfg.MaxPerInvW {
 		newChargeW = c.cfg.MaxPerInvW
-	}
-
-	// Don't exceed total max
-	totalNewW := newChargeW * 4
-	if totalNewW > c.cfg.MaxTotalW {
-		newChargeW = c.cfg.MaxTotalW / 4
 	}
 
 	if newChargeW != c.currentChargeW {
 		slog.Info("ramp_up_charge",
 			"grid_w", gridW,
 			"export_w", exportW,
-			"from_w", c.currentChargeW,
-			"to_w", newChargeW,
+			"from_per_inv_w", c.currentChargeW,
+			"to_per_inv_w", newChargeW,
+			"total_w", newChargeW*4,
 		)
 
-		// Apply to all inverters
 		for _, id := range c.cfg.AllUnitIDs() {
 			if err := c.insight.SetChargeMode(id, uint16(newChargeW)); err != nil {
 				slog.Error("failed to set charge", "unit", id, "error", err)
@@ -542,42 +570,60 @@ func (c *Controller) rampUpCharge(gridW int) {
 	}
 }
 
-// rampDownCharge decreases charge rate when importing
+// rampDownCharge decreases charge rate when importing too much
 func (c *Controller) rampDownCharge(gridW int) {
-	// Check hold time (shorter for ramp down)
+	// Check hold time (shorter for ramp down — 30s vs 10min)
 	if time.Since(c.lastRampAt) < 30*time.Second {
 		return
 	}
 
-	// Calculate import amount
-	importW := gridW
+	// overshoot = import - buffer (keep 500W buffer so we don't oscillate)
+	overshoot := gridW - c.cfg.TrimBufferW
+	if overshoot <= 0 {
+		return
+	}
 
-	// Trim by import amount plus buffer
-	trimW := importW + c.cfg.TrimBufferW
-	newChargeW := c.currentChargeW - trimW
+	// new_total = current_total - overshoot
+	currentTotalW := c.currentChargeW * 4
+	newTotalW := currentTotalW - overshoot
 
-	if newChargeW < c.cfg.StartPerInvW {
-		newChargeW = c.cfg.StartPerInvW
+	var newChargeW int
+	if newTotalW <= 0 {
+		newChargeW = 0
+	} else {
+		newChargeW = newTotalW / 4
 	}
 
 	if newChargeW != c.currentChargeW {
 		slog.Info("ramp_down_charge",
 			"grid_w", gridW,
-			"import_w", importW,
-			"from_w", c.currentChargeW,
-			"to_w", newChargeW,
+			"overshoot_w", overshoot,
+			"from_per_inv_w", c.currentChargeW,
+			"to_per_inv_w", newChargeW,
+			"total_w", newChargeW*4,
 		)
 
-		// Apply to all inverters
 		for _, id := range c.cfg.AllUnitIDs() {
-			if err := c.insight.SetChargeMode(id, uint16(newChargeW)); err != nil {
-				slog.Error("failed to set charge", "unit", id, "error", err)
-				return
+			if newChargeW > 0 {
+				if err := c.insight.SetChargeMode(id, uint16(newChargeW)); err != nil {
+					slog.Error("failed to set charge", "unit", id, "error", err)
+					return
+				}
+			} else {
+				if err := c.insight.SetIdleMode(id); err != nil {
+					slog.Error("failed to idle", "unit", id, "error", err)
+					return
+				}
 			}
 		}
 
 		c.currentChargeW = newChargeW
 		c.lastRampAt = time.Now()
+
+		// If trimmed to zero, go back to waiting for export
+		if newChargeW == 0 {
+			c.waitingForExport = true
+		}
 	}
 }
 
@@ -591,7 +637,7 @@ func (c *Controller) runNightDischargeLogic(grid wattnode.GridPower) {
 	}
 }
 
-// nightExportDetected handles export detection at night
+// nightExportDetected handles export detection at night — idle inverters until no export
 func (c *Controller) nightExportDetected(grid wattnode.GridPower) {
 	slog.Warn("night_export_detected",
 		"l1_w", grid.L1,
@@ -599,17 +645,13 @@ func (c *Controller) nightExportDetected(grid wattnode.GridPower) {
 		"total_w", grid.Total,
 	)
 
-	// Idle one inverter at a time from idle_order
 	idledCount := len(c.state.IdledInverters())
 	if idledCount >= 4 {
-		// All already idled - enter reduced state
-		if c.state.Current() != StateNightReduced {
-			c.state.Transition(StateNightReduced, "all inverters idled due to export")
-		}
+		// All already idled, nothing more to do
 		return
 	}
 
-	// Get next inverter to idle
+	// Get next inverter to idle from idle_order
 	nextToIdle := c.cfg.IdleOrder[idledCount]
 
 	slog.Info("idling_inverter_for_export",
@@ -617,33 +659,25 @@ func (c *Controller) nightExportDetected(grid wattnode.GridPower) {
 		"idled_count", idledCount+1,
 	)
 
-	// Set discharge to 0 for this inverter
-	if err := c.insight.SetDischargeLimit(nextToIdle, 0); err != nil {
+	if err := c.insight.SetIdleMode(nextToIdle); err != nil {
 		slog.Error("failed to idle inverter", "unit", nextToIdle, "error", err)
 		return
 	}
 
 	c.state.AddIdledInverter(nextToIdle)
 
-	// If all idled, transition to reduced
-	if idledCount+1 >= 4 {
-		c.state.Transition(StateNightReduced, "all inverters idled")
+	// Transition to NIGHT_REDUCED after first idle
+	if c.state.Current() != StateNightReduced {
+		c.state.Transition(StateNightReduced, "leg export detected, idled inverter(s)")
 	}
 }
 
-// runNightReducedLogic handles state when all inverters are idled at night
+// runNightReducedLogic monitors for continued export and idles more inverters
 func (c *Controller) runNightReducedLogic(grid wattnode.GridPower) {
-	// In reduced mode, all inverters are idled
-	// Check if we can resume (if allowed)
-	if !c.cfg.ResumeAllowed {
-		return
-	}
-
-	// Check if import is sustained (grid is positive = importing)
-	if grid.Total > 500 {
-		// Could potentially resume one inverter
-		// But current config says no resume allowed
-		slog.Debug("night_reduced_import_detected", "import_w", grid.Total)
+	// Still monitoring for export — if export returns, idle the next inverter
+	if grid.L1 < float32(-c.cfg.LegExportThresholdW) ||
+		grid.L2 < float32(-c.cfg.LegExportThresholdW) {
+		c.nightExportDetected(grid)
 	}
 }
 

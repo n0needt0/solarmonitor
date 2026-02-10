@@ -59,6 +59,18 @@ func (r *Reader) Close() error {
 	return r.handler.Close()
 }
 
+// WriteConfigRegister writes a single holding register (function code 6)
+func (r *Reader) WriteConfigRegister(register uint16, value uint16) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	_, err := r.client.WriteSingleRegister(register, value)
+	if err != nil {
+		return fmt.Errorf("write register %d = %d: %w", register, value, err)
+	}
+	return nil
+}
+
 // Read fetches current grid power from WattNode
 func (r *Reader) Read() (*GridPower, error) {
 	r.mu.Lock()
@@ -84,7 +96,7 @@ func (r *Reader) Read() (*GridPower, error) {
 	// Parse Float32 values (standard Big Endian)
 	// Negate values - USB WattNode CTs have reversed polarity
 	// Convention: Positive = importing, Negative = exporting
-	// Apply scale factor for CT ratio calibration
+	// Scale factor compensates for USB WattNode reading 2x actual
 	l1 := -parseFloat32BE(l1Data) * r.scaleFactor
 	l2 := -parseFloat32BE(l2Data) * r.scaleFactor
 	// Total register (1015) not reliable on this meter - calculate from L1+L2
@@ -100,13 +112,20 @@ func (r *Reader) Read() (*GridPower, error) {
 	return &r.lastPower, nil
 }
 
-// DiagConfig holds WattNode voltage readings for diagnostics
+// DiagConfig holds WattNode voltage, energy, and config readings for diagnostics
 type DiagConfig struct {
-	VoltageA float32
-	VoltageB float32
+	VoltageA       float32
+	VoltageB       float32
+	EnergySum      float32  // Total energy (kWh)
+	EnergyA        float32  // Phase A energy (kWh)
+	EnergyB        float32  // Phase B energy (kWh)
+	ConnectionType uint16   // 1=1P2W, 2=1P3W (split-phase), 3=3P4W
+	CtAmpsA        uint16   // CT rated amps Phase A
+	CtAmpsB        uint16   // CT rated amps Phase B
+	ConfigRegs     []uint16 // Raw config registers 1602-1611
 }
 
-// ReadDiagConfig reads WattNode voltage registers for diagnostics
+// ReadDiagConfig reads WattNode voltage and energy registers for diagnostics
 func (r *Reader) ReadDiagConfig() (*DiagConfig, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -120,6 +139,32 @@ func (r *Reader) ReadDiagConfig() (*DiagConfig, error) {
 	vData, err = r.client.ReadInputRegisters(RegVoltageB, 2)
 	if err == nil {
 		cfg.VoltageB = parseFloat32BE(vData)
+	}
+
+	eData, err := r.client.ReadInputRegisters(RegEnergySum, 2)
+	if err == nil {
+		cfg.EnergySum = parseFloat32BE(eData)
+	}
+	eData, err = r.client.ReadInputRegisters(RegEnergyA, 2)
+	if err == nil {
+		cfg.EnergyA = parseFloat32BE(eData)
+	}
+	eData, err = r.client.ReadInputRegisters(RegEnergyB, 2)
+	if err == nil {
+		cfg.EnergyB = parseFloat32BE(eData)
+	}
+
+	// Config registers via function code 3 (holding registers)
+	// Read block 1602-1611 (10 registers)
+	cData, err := r.client.ReadHoldingRegisters(RegConfigStart, 10)
+	if err == nil && len(cData) >= 20 {
+		cfg.ConfigRegs = make([]uint16, 10)
+		for i := 0; i < 10; i++ {
+			cfg.ConfigRegs[i] = uint16(cData[i*2])<<8 | uint16(cData[i*2+1])
+		}
+		cfg.CtAmpsA = cfg.ConfigRegs[1]        // 1603
+		cfg.CtAmpsB = cfg.ConfigRegs[2]        // 1604
+		cfg.ConnectionType = cfg.ConfigRegs[8] // 1610
 	}
 
 	return cfg, nil

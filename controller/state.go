@@ -137,21 +137,7 @@ func (sm *StateManager) AddIdledInverter(unitID byte) {
 	sm.idledInverters = append(sm.idledInverters, unitID)
 }
 
-// ActiveInverterCount returns count of inverters not idled
-func (sm *StateManager) ActiveInverterCount() int {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-	return 4 - len(sm.idledInverters)
-}
-
-// IsInverterIdled checks if a specific inverter has been idled
-func (sm *StateManager) IsInverterIdled(unitID byte) bool {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-	for _, id := range sm.idledInverters {
-		if id == unitID {
-			return true
-		}
-	}
-	return false
+// StateChangeCh returns the channel that receives state changes
+func (sm *StateManager) StateChangeCh() <-chan StateChange {
+	return sm.stateChangeCh
 }

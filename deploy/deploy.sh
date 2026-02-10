@@ -31,7 +31,7 @@ ssh ${PI_HOST} "sudo mv /tmp/solarcontrol.logrotate /etc/logrotate.d/solarcontro
 
 echo "Starting solarcontrol..."
 ssh ${PI_HOST} "sudo systemctl enable solarcontrol"
-ssh ${PI_HOST} "sudo systemctl start solarcontrol"
+ssh ${PI_HOST} "sudo systemctl restart solarcontrol"
 
 echo "Checking status..."
 sleep 2

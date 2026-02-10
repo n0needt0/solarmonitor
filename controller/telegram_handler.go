@@ -28,11 +28,6 @@ func NewTelegramHandler(ctrl *Controller, bot *telegram.Bot, stepW int) *Telegra
 func (h *TelegramHandler) HandleStatus() string {
 	status := h.ctrl.Status()
 
-	avgSOC := 0
-	if status.BMSStatus != nil {
-		avgSOC = status.BMSStatus.TotalSOC()
-	}
-
 	currentState := h.ctrl.state.Current()
 	unitIDs := h.ctrl.cfg.AllUnitIDs()
 	idled := status.IdledInverters
@@ -71,7 +66,6 @@ func (h *TelegramHandler) HandleStatus() string {
 		GridL2:         status.GridPower.L2,
 		GridTotal:      status.GridPower.Total,
 		Inverters:      inverters,
-		AvgSOC:         avgSOC,
 		ChargeW:        status.ChargeW,
 		IdledInverters: idled,
 		Uptime:         time.Since(h.startTime),
