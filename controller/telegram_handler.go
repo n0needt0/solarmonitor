@@ -28,16 +28,40 @@ func NewTelegramHandler(ctrl *Controller, bot *telegram.Bot, stepW int) *Telegra
 func (h *TelegramHandler) HandleStatus() string {
 	status := h.ctrl.Status()
 
-	var soc [4]int
 	avgSOC := 0
 	if status.BMSStatus != nil {
-		soc = status.BMSStatus.SOC
 		avgSOC = status.BMSStatus.TotalSOC()
 	}
 
-	dischargeW := 0
-	if h.ctrl.state.Current() == StateNightDischarge || h.ctrl.state.Current() == StateNightReduced {
-		dischargeW = h.ctrl.cfg.DischargePerInvW
+	currentState := h.ctrl.state.Current()
+	unitIDs := h.ctrl.cfg.AllUnitIDs()
+	idled := status.IdledInverters
+
+	var inverters [4]telegram.InverterData
+	for i, uid := range unitIDs {
+		inv := telegram.InverterData{UnitID: uid}
+
+		if status.BMSStatus != nil {
+			inv.SOC = status.BMSStatus.SOC[i]
+			inv.ActualW = int(status.BMSStatus.Power[i])
+		}
+
+		switch currentState {
+		case StateDayCharge:
+			inv.TargetW = status.ChargeW
+		case StateNightDischarge, StateNightReduced:
+			inv.TargetW = h.ctrl.cfg.DischargePerInvW
+		}
+
+		for _, idledID := range idled {
+			if uid == idledID {
+				inv.Idled = true
+				inv.TargetW = 0
+				break
+			}
+		}
+
+		inverters[i] = inv
 	}
 
 	data := telegram.StatusData{
@@ -46,11 +70,10 @@ func (h *TelegramHandler) HandleStatus() string {
 		GridL1:         status.GridPower.L1,
 		GridL2:         status.GridPower.L2,
 		GridTotal:      status.GridPower.Total,
-		SOC:            soc,
+		Inverters:      inverters,
 		AvgSOC:         avgSOC,
 		ChargeW:        status.ChargeW,
-		DischargeW:     dischargeW,
-		IdledInverters: status.IdledInverters,
+		IdledInverters: idled,
 		Uptime:         time.Since(h.startTime),
 	}
 

@@ -14,6 +14,15 @@ const (
 	AlertRecovery      = "recovery"
 )
 
+// InverterData holds per-inverter status
+type InverterData struct {
+	UnitID   byte
+	SOC      int
+	ActualW  int // Actual battery power (positive=charging, negative=discharging)
+	TargetW  int // Commanded EPC power
+	Idled    bool
+}
+
 // StatusData holds data for status response
 type StatusData struct {
 	State          string
@@ -21,7 +30,7 @@ type StatusData struct {
 	GridL1         float32
 	GridL2         float32
 	GridTotal      float32
-	SOC            [4]int
+	Inverters      [4]InverterData
 	AvgSOC         int
 	ChargeW        int
 	DischargeW     int
@@ -38,37 +47,29 @@ func FormatStatus(d StatusData) string {
 		gridAmount = -d.GridTotal
 	}
 
-	// Check if in dead band
 	deadBand := ""
 	if d.GridTotal >= -1000 && d.GridTotal <= 2000 {
 		deadBand = " (dead band)"
 	}
 
-	msg := fmt.Sprintf(`State:       %s
-Grid:        %s %.1fkW%s
-L1:          %+.0fW  L2: %+.0fW
-`,
-		d.State,
-		gridStatus, gridAmount/1000, deadBand,
-		d.GridL1, d.GridL2,
-	)
+	msg := fmt.Sprintf("State:  %s (%s)\n", d.State, formatDuration(d.TimeInState))
+	msg += fmt.Sprintf("Grid:   %s %.1fkW%s\n", gridStatus, gridAmount/1000, deadBand)
+	msg += fmt.Sprintf("L1: %+.0fW  L2: %+.0fW\n\n", d.GridL1, d.GridL2)
 
-	if d.ChargeW > 0 {
-		msg += fmt.Sprintf("Charge:      %dW/inv (%dW total)\n",
-			d.ChargeW, d.ChargeW*4)
-	} else if d.DischargeW > 0 {
-		activeCount := 4 - len(d.IdledInverters)
-		msg += fmt.Sprintf("Discharge:   %dW × %d (%dW total)\n",
-			d.DischargeW, activeCount, d.DischargeW*activeCount)
+	// Per-inverter table
+	totalActual := 0
+	for _, inv := range d.Inverters {
+		status := ""
+		if inv.Idled {
+			status = " IDLE"
+		}
+		msg += fmt.Sprintf("#%d  SOC:%3d%%  actual:%+5dW  target:%4dW%s\n",
+			inv.UnitID, inv.SOC, inv.ActualW, inv.TargetW, status)
+		totalActual += inv.ActualW
 	}
 
-	msg += fmt.Sprintf("SOC:         %d%% avg\n", d.AvgSOC)
-
-	if len(d.IdledInverters) > 0 {
-		msg += fmt.Sprintf("Idled:       %v\n", d.IdledInverters)
-	}
-
-	msg += fmt.Sprintf("Uptime:      %s", formatDuration(d.Uptime))
+	msg += fmt.Sprintf("Avg SOC: %d%%  Total: %+dW\n", d.AvgSOC, totalActual)
+	msg += fmt.Sprintf("Uptime:  %s", formatDuration(d.Uptime))
 
 	return msg
 }
