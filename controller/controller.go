@@ -43,6 +43,7 @@ type Controller struct {
 	lastRampAt        time.Time
 	lastKeepaliveAt   time.Time
 	consecutiveFail   int
+	starvationAt      time.Time // When we first saw low power at floor rate
 
 	// Session statistics
 	stats *StatsTracker
@@ -534,11 +535,42 @@ func (c *Controller) runDayChargeLogic(grid wattnode.GridPower) {
 	if gridW < -c.cfg.DeadBandExportW {
 		// Exporting more than dead band - increase charge
 		c.rampUpCharge(gridW)
+		c.starvationAt = time.Time{} // reset starvation timer
 	} else if gridW > c.cfg.DeadBandImportW {
 		// Importing more than dead band - decrease charge
 		c.rampDownCharge(gridW)
 	}
-	// Otherwise in dead band - hold current level
+
+	// Starvation check: at floor with export < 500W for 20 min → idle all
+	const starvationExportW = 500
+	const starvationTimeout = 20 * time.Minute
+	atFloor := c.currentChargeW > 0 && c.currentChargeW <= c.cfg.StartPerInvW
+	lowPower := exportW < starvationExportW
+
+	if atFloor && lowPower {
+		if c.starvationAt.IsZero() {
+			c.starvationAt = time.Now()
+			slog.Info("starvation_timer_started",
+				"charge_w", c.currentChargeW,
+				"export_w", exportW,
+			)
+		} else if time.Since(c.starvationAt) >= starvationTimeout {
+			slog.Info("starvation_idle",
+				"duration", time.Since(c.starvationAt),
+				"export_w", exportW,
+			)
+			c.currentChargeW = 0
+			c.waitingForExport = true
+			c.starvationAt = time.Time{}
+			if err := c.insight.IdleAllInverters(c.cfg.AllUnitIDs()); err != nil {
+				slog.Error("failed to idle inverters on starvation", "error", err)
+			}
+		}
+	} else if !atFloor || !lowPower {
+		if !c.starvationAt.IsZero() {
+			c.starvationAt = time.Time{}
+		}
+	}
 }
 
 // startCharging begins charging — grabs all available export immediately
