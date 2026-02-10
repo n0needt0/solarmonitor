@@ -2,6 +2,8 @@ package insight
 
 import (
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,10 +23,10 @@ type Client struct {
 	readClient   modbus.Client
 	writeClient  modbus.Client
 
-	mu           sync.Mutex
-	lastWriteAt  time.Time
-	connected    bool
-	lastErr      error
+	mu          sync.Mutex
+	lastWriteAt time.Time
+	connected   bool
+	lastErr     error
 }
 
 // NewClient creates an Insight Modbus TCP client
@@ -42,6 +44,19 @@ func NewClient(host string, readPort, writePort, minGapMs, timeoutMs int) *Clien
 func (c *Client) Connect() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	return c.connectLocked()
+}
+
+// connectLocked does the actual connection (must hold lock)
+func (c *Client) connectLocked() error {
+	// Close existing connections if any
+	if c.readHandler != nil {
+		c.readHandler.Close()
+	}
+	if c.writeHandler != nil {
+		c.writeHandler.Close()
+	}
 
 	// Read port (503)
 	c.readHandler = modbus.NewTCPClientHandler(fmt.Sprintf("%s:%d", c.host, c.readPort))
@@ -62,6 +77,29 @@ func (c *Client) Connect() error {
 
 	c.connected = true
 	return nil
+}
+
+// reconnectIfNeeded checks for connection errors and reconnects
+// Returns true if reconnection was successful
+func (c *Client) reconnectIfNeeded(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := err.Error()
+	if strings.Contains(errStr, "broken pipe") ||
+		strings.Contains(errStr, "EOF") ||
+		strings.Contains(errStr, "connection reset") ||
+		strings.Contains(errStr, "connection refused") {
+		slog.Warn("insight connection lost, reconnecting", "error", err)
+		if reconnErr := c.connectLocked(); reconnErr != nil {
+			slog.Error("insight reconnect failed", "error", reconnErr)
+			return false
+		}
+		slog.Info("insight reconnected")
+		return true
+	}
+	return false
 }
 
 // Close closes both connections
@@ -98,84 +136,84 @@ func (c *Client) waitForGap() {
 }
 
 // ReadRegister reads a single holding register from an inverter
-// Insight gateway uses full register address
 func (c *Client) ReadRegister(unitID byte, register uint16) (uint16, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.readHandler.SlaveId = unitID
-	data, err := c.readClient.ReadHoldingRegisters(register, 1)
-	if err != nil {
-		c.lastErr = err
-		return 0, fmt.Errorf("read register %d from unit %d: %w", register, unitID, err)
-	}
+	for attempt := 0; attempt < 2; attempt++ {
+		c.readHandler.SlaveId = unitID
+		data, err := c.readClient.ReadHoldingRegisters(register, 1)
+		if err != nil {
+			c.lastErr = err
+			if c.reconnectIfNeeded(err) && attempt == 0 {
+				continue
+			}
+			return 0, fmt.Errorf("read register %d from unit %d: %w", register, unitID, err)
+		}
 
-	if len(data) < 2 {
-		return 0, fmt.Errorf("short response from unit %d", unitID)
-	}
+		if len(data) < 2 {
+			return 0, fmt.Errorf("short response from unit %d", unitID)
+		}
 
-	return uint16(data[0])<<8 | uint16(data[1]), nil
+		return uint16(data[0])<<8 | uint16(data[1]), nil
+	}
+	return 0, fmt.Errorf("read register failed after retry")
 }
 
 // ReadHoldingRegisters reads multiple consecutive holding registers
-// Insight gateway uses full register address
 func (c *Client) ReadHoldingRegisters(unitID byte, startRegister uint16, count uint16) ([]uint16, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.readHandler.SlaveId = unitID
-	data, err := c.readClient.ReadHoldingRegisters(startRegister, count)
-	if err != nil {
-		c.lastErr = err
-		return nil, fmt.Errorf("read holding registers %d-%d from unit %d: %w", startRegister, startRegister+count-1, unitID, err)
-	}
+	for attempt := 0; attempt < 2; attempt++ {
+		c.readHandler.SlaveId = unitID
+		data, err := c.readClient.ReadHoldingRegisters(startRegister, count)
+		if err != nil {
+			c.lastErr = err
+			if c.reconnectIfNeeded(err) && attempt == 0 {
+				continue
+			}
+			return nil, fmt.Errorf("read holding registers %d-%d from unit %d: %w", startRegister, startRegister+count-1, unitID, err)
+		}
 
-	result := make([]uint16, count)
-	for i := uint16(0); i < count; i++ {
-		result[i] = uint16(data[i*2])<<8 | uint16(data[i*2+1])
-	}
-	return result, nil
-}
+		expected := int(count * 2)
+		if len(data) < expected {
+			return nil, fmt.Errorf("short response from unit %d: got %d bytes, expected %d", unitID, len(data), expected)
+		}
 
-// ReadInputRegisters reads multiple consecutive input registers
-// Used for BMS data (registers 960+)
-func (c *Client) ReadInputRegisters(unitID byte, startRegister uint16, count uint16) ([]uint16, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.readHandler.SlaveId = unitID
-	data, err := c.readClient.ReadInputRegisters(startRegister, count)
-	if err != nil {
-		c.lastErr = err
-		return nil, fmt.Errorf("read input registers %d-%d from unit %d: %w", startRegister, startRegister+count-1, unitID, err)
+		result := make([]uint16, count)
+		for i := uint16(0); i < count; i++ {
+			result[i] = uint16(data[i*2])<<8 | uint16(data[i*2+1])
+		}
+		return result, nil
 	}
-
-	result := make([]uint16, count)
-	for i := uint16(0); i < count; i++ {
-		result[i] = uint16(data[i*2])<<8 | uint16(data[i*2+1])
-	}
-	return result, nil
+	return nil, fmt.Errorf("read holding registers failed after retry")
 }
 
 // WriteRegister writes a single holding register to an inverter
-// Insight gateway uses full register address (40213 not offset 212)
 func (c *Client) WriteRegister(unitID byte, register uint16, value uint16) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.waitForGap()
+	// Try up to 2 times (initial + 1 retry after reconnect)
+	for attempt := 0; attempt < 2; attempt++ {
+		c.waitForGap()
 
-	c.writeHandler.SlaveId = unitID
-	// Insight uses full register address
-	_, err := c.writeClient.WriteSingleRegister(register, value)
-	c.lastWriteAt = time.Now()
+		c.writeHandler.SlaveId = unitID
+		_, err := c.writeClient.WriteSingleRegister(register, value)
+		c.lastWriteAt = time.Now()
 
-	if err != nil {
-		c.lastErr = err
-		return fmt.Errorf("write register %d = %d to unit %d: %w", register, value, unitID, err)
+		if err != nil {
+			c.lastErr = err
+			if c.reconnectIfNeeded(err) && attempt == 0 {
+				// Reconnected, retry once
+				continue
+			}
+			return fmt.Errorf("write register %d = %d to unit %d: %w", register, value, unitID, err)
+		}
+		return nil
 	}
-
-	return nil
+	return fmt.Errorf("write register failed after retry")
 }
 
 // IsConnected returns connection status

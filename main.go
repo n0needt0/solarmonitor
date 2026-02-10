@@ -1,14 +1,18 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
+	"github.com/n0needt0/solarcontrol/controller"
 	"github.com/n0needt0/solarcontrol/insight"
+	"github.com/n0needt0/solarcontrol/telegram"
 	"github.com/n0needt0/solarcontrol/wattnode"
 )
 
@@ -79,7 +83,7 @@ func main() {
 	if err != nil {
 		slog.Error("failed to read WattNode", "error", err)
 	} else {
-		slog.Info("wattnode read",
+		slog.Info("wattnode test read",
 			"l1_w", power.L1,
 			"l2_w", power.L2,
 			"total_w", power.Total,
@@ -91,20 +95,86 @@ func main() {
 	if err != nil {
 		slog.Error("failed to read BMS", "error", err)
 	} else {
-		slog.Info("bms read",
+		slog.Info("bms test read",
 			"soc", bms.SOC,
 			"power", bms.Power,
 			"total_soc", bms.TotalSOC(),
 		)
 	}
 
+	// Build controller config
+	ctrlCfg := &controller.Config{
+		MasterUnitID: cfg.Inverters.MasterUnitID,
+		SlaveUnitIDs: cfg.Inverters.SlaveUnitIDs,
+		IdleOrder:    cfg.Inverters.IdleOrder,
+
+		ChargeStartHour: cfg.Charge.StartHour,
+		ChargeEndHour:   cfg.Charge.EndHour,
+
+		StartPerInvW:    cfg.Charge.StartPerInvW,
+		MaxPerInvW:      cfg.Charge.MaxPerInvW,
+		MaxTotalW:       cfg.Charge.MaxTotalW,
+		ExportStartW:    cfg.Charge.ExportStartW,
+		ExportRampW:     cfg.Charge.ExportRampW,
+		ImportTrimW:     cfg.Charge.ImportTrimW,
+		TrimBufferW:     cfg.Charge.TrimBufferW,
+		HoldSec:         cfg.Charge.HoldSec,
+		DeadBandExportW: cfg.Charge.DeadBandExportW,
+		DeadBandImportW: cfg.Charge.DeadBandImportW,
+
+		DischargePerInvW: cfg.Discharge.PerInverterW,
+
+		LegExportThresholdW: cfg.NightGuard.LegExportThresholdW,
+		ResumeAllowed:       cfg.NightGuard.ResumeAllowed,
+
+		MaxReadFailures: cfg.Safety.MaxReadFailures,
+
+		GridReadInterval: time.Duration(cfg.WattNode.ReadIntervalSec) * time.Second,
+		BMSReadInterval:  time.Duration(cfg.Insight.SOCReadIntervalSec) * time.Second,
+	}
+
+	// Create controller
+	ctrl := controller.New(ctrlCfg, ins, wn)
+
+	// Create telegram bot
+	bot := telegram.NewBot(
+		cfg.Telegram.BotToken,
+		cfg.Telegram.ChatID,
+		cfg.Telegram.PollTimeoutSec,
+	)
+
+	// Create telegram handler and connect to bot
+	tgHandler := controller.NewTelegramHandler(ctrl, bot, cfg.Telegram.ManualStepW)
+	bot.SetHandler(tgHandler)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start controller
+	if err := ctrl.Start(ctx); err != nil {
+		slog.Error("failed to start controller", "error", err)
+		os.Exit(1)
+	}
+
+	// Start telegram bot
+	if err := bot.Start(ctx); err != nil {
+		slog.Error("failed to start telegram bot", "error", err)
+		// Continue without telegram - not fatal
+	}
+
+	slog.Info("solarcontrol running")
+
 	// Wait for shutdown signal
-	slog.Info("solarcontrol ready - waiting for shutdown signal")
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 
-	slog.Info("shutting down")
+	slog.Info("shutdown signal received")
+	cancel()
+	bot.Stop()
+	ctrl.Stop()
+
+	slog.Info("solarcontrol stopped")
 }
 
 func setupLogging(level, file string) {

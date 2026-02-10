@@ -50,8 +50,8 @@ func (b *BatteryStatus) TotalPower() int {
 
 // ReadBatteryStatus reads SOC and power for all 4 battery banks
 func (c *Client) ReadBatteryStatus() (*BatteryStatus, error) {
-	// Bulk read from unit ID 1 (BMS gateway) - uses input registers
-	data, err := c.ReadInputRegisters(1, RegBMSBulkStart, RegBMSBulkCount)
+	// Bulk read from unit ID 1 (BMS gateway) - holding registers on port 503
+	data, err := c.ReadHoldingRegisters(1, RegBMSBulkStart, RegBMSBulkCount)
 	if err != nil {
 		return nil, fmt.Errorf("bulk BMS read: %w", err)
 	}

@@ -15,18 +15,10 @@ const (
 
 // EPC mode values
 const (
-	EPCModeIdle   uint16 = 0
-	EPCModeCharge uint16 = 1
+	EPCModeIdle      uint16 = 0
+	EPCModeCharge    uint16 = 1
+	EPCModeDischarge uint16 = 2
 )
-
-// InverterState holds the current state of an inverter
-type InverterState struct {
-	UnitID        byte
-	ChargeLimit   uint16 // watts
-	EPCMode       uint16 // 0=idle, 1=charge
-	DischargeMax  uint16 // watts
-	RechargeSOC   uint16 // % × 10
-}
 
 // SetChargeMode sets an inverter to charge mode with specified power limit
 func (c *Client) SetChargeMode(unitID byte, powerW uint16) error {
@@ -56,6 +48,23 @@ func (c *Client) SetIdleMode(unitID byte) error {
 	return nil
 }
 
+// SetDischargeMode sets an inverter to discharge mode with specified power limit
+func (c *Client) SetDischargeMode(unitID byte, powerW uint16) error {
+	slog.Info("set_discharge_mode", "unit", unitID, "power_w", powerW)
+
+	// Set EPC mode to discharge (2)
+	if err := c.WriteRegister(unitID, RegEPCModeCommand, EPCModeDischarge); err != nil {
+		return fmt.Errorf("set discharge mode: %w", err)
+	}
+
+	// Set discharge limit
+	if err := c.WriteRegister(unitID, RegEPCMaxDischarge, powerW); err != nil {
+		return fmt.Errorf("set discharge limit: %w", err)
+	}
+
+	return nil
+}
+
 // SetDischargeLimit sets the maximum discharge power for an inverter
 func (c *Client) SetDischargeLimit(unitID byte, powerW uint16) error {
 	slog.Info("set_discharge_limit", "unit", unitID, "power_w", powerW)
@@ -65,38 +74,6 @@ func (c *Client) SetDischargeLimit(unitID byte, powerW uint16) error {
 	}
 
 	return nil
-}
-
-// SetRechargeSOC sets the recharge SOC threshold
-func (c *Client) SetRechargeSOC(unitID byte, socPercent int) error {
-	slog.Info("set_recharge_soc", "unit", unitID, "soc_pct", socPercent)
-
-	// Register expects % × 10
-	value := uint16(socPercent * 10)
-	if err := c.WriteRegister(unitID, RegRechargeSOC, value); err != nil {
-		return fmt.Errorf("set recharge SOC: %w", err)
-	}
-
-	return nil
-}
-
-// ReadInverterState reads current state from an inverter
-func (c *Client) ReadInverterState(unitID byte) (*InverterState, error) {
-	state := &InverterState{UnitID: unitID}
-
-	var err error
-
-	state.ChargeLimit, err = c.ReadRegister(unitID, RegEPCChargeMax)
-	if err != nil {
-		return nil, fmt.Errorf("read charge limit: %w", err)
-	}
-
-	state.EPCMode, err = c.ReadRegister(unitID, RegEPCModeCommand)
-	if err != nil {
-		return nil, fmt.Errorf("read EPC mode: %w", err)
-	}
-
-	return state, nil
 }
 
 // IdleAllInverters sets all inverters to idle mode
@@ -109,22 +86,3 @@ func (c *Client) IdleAllInverters(unitIDs []byte) error {
 	return nil
 }
 
-// SetAllChargeMode sets all inverters to charge mode with specified power
-func (c *Client) SetAllChargeMode(unitIDs []byte, powerW uint16) error {
-	for _, id := range unitIDs {
-		if err := c.SetChargeMode(id, powerW); err != nil {
-			return fmt.Errorf("charge unit %d: %w", id, err)
-		}
-	}
-	return nil
-}
-
-// SetAllDischargeLimit sets discharge limit on all inverters
-func (c *Client) SetAllDischargeLimit(unitIDs []byte, powerW uint16) error {
-	for _, id := range unitIDs {
-		if err := c.SetDischargeLimit(id, powerW); err != nil {
-			return fmt.Errorf("discharge limit unit %d: %w", id, err)
-		}
-	}
-	return nil
-}

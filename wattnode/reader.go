@@ -77,8 +77,10 @@ func (r *Reader) Read() (*GridPower, error) {
 	}
 
 	// Parse Float32 values (standard Big Endian)
-	l1 := parseFloat32BE(l1Data)
-	l2 := parseFloat32BE(l2Data)
+	// Negate values - USB WattNode CTs have reversed polarity
+	// Convention: Positive = importing, Negative = exporting
+	l1 := -parseFloat32BE(l1Data)
+	l2 := -parseFloat32BE(l2Data)
 	// Total register (1015) not reliable on this meter - calculate from L1+L2
 	r.lastPower = GridPower{
 		L1:    l1,
