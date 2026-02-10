@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -453,11 +454,23 @@ func (c *Controller) checkTimeTransitions() {
 			}
 		}
 	} else {
-		if currentState != StateNightDischarge && currentState != StateNightReduced {
-			c.stats.StartSession(SessionDischarge, soc)
-			c.state.Transition(StateNightDischarge, "entering discharge window")
-			if err := c.applyCurrentState(); err != nil {
-				slog.Error("failed to apply night discharge state", "error", err)
+		if currentState != StateNightDischarge && currentState != StateNightReduced && currentState != StateStopped {
+			const minDischargeSOC = 30
+			if soc > 0 && soc < minDischargeSOC {
+				slog.Info("discharge_skipped_low_soc",
+					"soc", soc,
+					"min", minDischargeSOC,
+				)
+				c.state.Transition(StateStopped, fmt.Sprintf("SOC %d%% below %d%% minimum for discharge", soc, minDischargeSOC))
+				if err := c.insight.IdleAllInverters(c.cfg.AllUnitIDs()); err != nil {
+					slog.Error("failed to idle inverters on low SOC skip", "error", err)
+				}
+			} else {
+				c.stats.StartSession(SessionDischarge, soc)
+				c.state.Transition(StateNightDischarge, "entering discharge window")
+				if err := c.applyCurrentState(); err != nil {
+					slog.Error("failed to apply night discharge state", "error", err)
+				}
 			}
 		}
 	}
