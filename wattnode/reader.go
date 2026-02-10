@@ -60,7 +60,8 @@ func (r *Reader) Read() (*GridPower, error) {
 	defer r.mu.Unlock()
 
 	// Read L1 power (2 registers for Float32)
-	l1Data, err := r.client.ReadInputRegisters(RegPowerA-1, 2)
+	// WattNode register addresses are used directly (no offset)
+	l1Data, err := r.client.ReadInputRegisters(RegPowerA, 2)
 	if err != nil {
 		r.consecutiveFailures++
 		r.lastErr = err
@@ -68,26 +69,21 @@ func (r *Reader) Read() (*GridPower, error) {
 	}
 
 	// Read L2 power
-	l2Data, err := r.client.ReadInputRegisters(RegPowerB-1, 2)
+	l2Data, err := r.client.ReadInputRegisters(RegPowerB, 2)
 	if err != nil {
 		r.consecutiveFailures++
 		r.lastErr = err
 		return nil, fmt.Errorf("read L2 power: %w", err)
 	}
 
-	// Read total power
-	totalData, err := r.client.ReadInputRegisters(RegPowerSum-1, 2)
-	if err != nil {
-		r.consecutiveFailures++
-		r.lastErr = err
-		return nil, fmt.Errorf("read total power: %w", err)
-	}
-
-	// Parse Float32 values (WattNode uses BE bytes, LE word order)
+	// Parse Float32 values (standard Big Endian)
+	l1 := parseFloat32BE(l1Data)
+	l2 := parseFloat32BE(l2Data)
+	// Total register (1015) not reliable on this meter - calculate from L1+L2
 	r.lastPower = GridPower{
-		L1:    parseFloat32BELE(l1Data),
-		L2:    parseFloat32BELE(l2Data),
-		Total: parseFloat32BELE(totalData),
+		L1:    l1,
+		L2:    l2,
+		Total: l1 + l2,
 	}
 	r.lastRead = time.Now()
 	r.lastErr = nil
@@ -117,14 +113,13 @@ func (r *Reader) LastError() error {
 	return r.lastErr
 }
 
-// parseFloat32BELE parses a Float32 with Big Endian bytes and Little Endian word order
-// This is the format used by WattNode meters
-func parseFloat32BELE(data []byte) float32 {
+// parseFloat32BE parses a Float32 in standard Big Endian format
+// WattNode returns registers in order [high_word, low_word]
+// Data bytes come as: [r0_hi, r0_lo, r1_hi, r1_lo] = standard BE float
+func parseFloat32BE(data []byte) float32 {
 	if len(data) != 4 {
 		return 0
 	}
-	// Swap word order: bytes come as [W1H, W1L, W2H, W2L], need [W2H, W2L, W1H, W1L]
-	swapped := []byte{data[2], data[3], data[0], data[1]}
-	bits := binary.BigEndian.Uint32(swapped)
+	bits := binary.BigEndian.Uint32(data)
 	return math.Float32frombits(bits)
 }

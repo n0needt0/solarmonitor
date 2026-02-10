@@ -1,6 +1,6 @@
 wattnode:
   port: /dev/ttyUSB0
-  baud: 9600
+  baud: 19200
   unit_id: 1
   read_interval_sec: 10
 
