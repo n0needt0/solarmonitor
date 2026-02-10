@@ -65,8 +65,8 @@ type Config struct {
 	MaxPerInvW      int
 	MaxTotalW       int
 	ExportStartW    int
-	TrimBufferW     int
-	HoldSec         int
+	RampUpHoldSec   int
+	RampDownHoldSec int
 	DeadBandExportW int
 	DeadBandImportW int
 
@@ -508,11 +508,35 @@ func (c *Controller) runDayChargeLogic(grid wattnode.GridPower) {
 	// Otherwise in dead band - hold current level
 }
 
-// startCharging begins charging at initial rate
+// startCharging begins charging — grabs all available export immediately
 func (c *Controller) startCharging() {
-	c.currentChargeW = c.cfg.StartPerInvW
+	c.mu.RLock()
+	gridW := int(c.gridPower.Total)
+	c.mu.RUnlock()
+
+	// Take all available export, minimum StartPerInvW
+	exportW := 0
+	if gridW < 0 {
+		exportW = -gridW
+	}
+
+	newTotalW := exportW
+	if newTotalW > c.cfg.MaxTotalW {
+		newTotalW = c.cfg.MaxTotalW
+	}
+
+	newChargeW := newTotalW / 4
+	if newChargeW < c.cfg.StartPerInvW {
+		newChargeW = c.cfg.StartPerInvW
+	}
+	if newChargeW > c.cfg.MaxPerInvW {
+		newChargeW = c.cfg.MaxPerInvW
+	}
+
+	c.currentChargeW = newChargeW
 
 	slog.Info("starting_charge",
+		"export_w", exportW,
 		"per_inv_w", c.currentChargeW,
 		"total_w", c.currentChargeW*4,
 	)
@@ -529,8 +553,8 @@ func (c *Controller) startCharging() {
 
 // rampUpCharge increases charge rate by taking all available export
 func (c *Controller) rampUpCharge(gridW int) {
-	// Check hold time
-	if time.Since(c.lastRampAt) < time.Duration(c.cfg.HoldSec)*time.Second {
+	// Check hold time (fast ramp up)
+	if time.Since(c.lastRampAt) < time.Duration(c.cfg.RampUpHoldSec)*time.Second {
 		return
 	}
 
@@ -570,60 +594,43 @@ func (c *Controller) rampUpCharge(gridW int) {
 	}
 }
 
-// rampDownCharge decreases charge rate when importing too much
+// rampDownCharge decreases charge rate by fixed step, never stops completely
 func (c *Controller) rampDownCharge(gridW int) {
-	// Check hold time (shorter for ramp down — 30s vs 10min)
-	if time.Since(c.lastRampAt) < 30*time.Second {
+	// Check hold time (slow ramp down — ride through clouds)
+	if time.Since(c.lastRampAt) < time.Duration(c.cfg.RampDownHoldSec)*time.Second {
 		return
 	}
 
-	// overshoot = import - buffer (keep 500W buffer so we don't oscillate)
-	overshoot := gridW - c.cfg.TrimBufferW
-	if overshoot <= 0 {
-		return
-	}
-
-	// new_total = current_total - overshoot
+	// Drop by fixed step (600W total = 150W/inv)
+	const trimStepW = 600
 	currentTotalW := c.currentChargeW * 4
-	newTotalW := currentTotalW - overshoot
+	newTotalW := currentTotalW - trimStepW
 
-	var newChargeW int
-	if newTotalW <= 0 {
-		newChargeW = 0
-	} else {
-		newChargeW = newTotalW / 4
+	// Never go below starting rate — keep charging
+	minTotalW := c.cfg.StartPerInvW * 4
+	if newTotalW < minTotalW {
+		newTotalW = minTotalW
 	}
+
+	newChargeW := newTotalW / 4
 
 	if newChargeW != c.currentChargeW {
 		slog.Info("ramp_down_charge",
 			"grid_w", gridW,
-			"overshoot_w", overshoot,
 			"from_per_inv_w", c.currentChargeW,
 			"to_per_inv_w", newChargeW,
 			"total_w", newChargeW*4,
 		)
 
 		for _, id := range c.cfg.AllUnitIDs() {
-			if newChargeW > 0 {
-				if err := c.insight.SetChargeMode(id, uint16(newChargeW)); err != nil {
-					slog.Error("failed to set charge", "unit", id, "error", err)
-					return
-				}
-			} else {
-				if err := c.insight.SetIdleMode(id); err != nil {
-					slog.Error("failed to idle", "unit", id, "error", err)
-					return
-				}
+			if err := c.insight.SetChargeMode(id, uint16(newChargeW)); err != nil {
+				slog.Error("failed to set charge", "unit", id, "error", err)
+				return
 			}
 		}
 
 		c.currentChargeW = newChargeW
 		c.lastRampAt = time.Now()
-
-		// If trimmed to zero, go back to waiting for export
-		if newChargeW == 0 {
-			c.waitingForExport = true
-		}
 	}
 }
 

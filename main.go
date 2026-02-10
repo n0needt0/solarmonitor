@@ -54,14 +54,17 @@ func main() {
 	defer wn.Close()
 	slog.Info("connected to WattNode", "port", cfg.WattNode.Port)
 
-	// Fix WattNode config: disable Phase C, restore ConnectionType=1
+	// Fix WattNode config for split-phase 120/240V
 	if err := wn.WriteConfigRegister(wattnode.RegCtAmpsC, 0); err != nil {
 		slog.Warn("failed to set CtAmpsC=0", "error", err)
 	}
-	if err := wn.WriteConfigRegister(wattnode.RegConnectionType, 1); err != nil {
-		slog.Warn("failed to set ConnectionType=1", "error", err)
+	if err := wn.WriteConfigRegister(wattnode.RegConnectionType, 2); err != nil {
+		slog.Warn("failed to set ConnectionType=2", "error", err)
 	}
-	slog.Info("wattnode config applied", "ct_amps_c", 0, "connection_type", 1)
+	if err := wn.WriteConfigRegister(wattnode.RegPhaseOffset, 180); err != nil {
+		slog.Warn("failed to set PhaseOffset=180", "error", err)
+	}
+	slog.Info("wattnode config applied", "ct_amps_c", 0, "connection_type", 2, "phase_offset", 180)
 
 	// Connect to Insight
 	ins := insight.NewClient(
@@ -102,7 +105,7 @@ func main() {
 			"ct_amps_a", diag.CtAmpsA,
 			"ct_amps_b", diag.CtAmpsB,
 			"connection_type", diag.ConnectionType,
-			"config_regs_1602_1611", diag.ConfigRegs,
+			"config_regs_1602_1621", diag.ConfigRegs,
 		)
 	}
 
@@ -143,8 +146,8 @@ func main() {
 		MaxPerInvW:      cfg.Charge.MaxPerInvW,
 		MaxTotalW:       cfg.Charge.MaxTotalW,
 		ExportStartW:    cfg.Charge.ExportStartW,
-		TrimBufferW:     cfg.Charge.TrimBufferW,
-		HoldSec:         cfg.Charge.HoldSec,
+		RampUpHoldSec:   cfg.Charge.RampUpHoldSec,
+		RampDownHoldSec: cfg.Charge.RampDownHoldSec,
 		DeadBandExportW: cfg.Charge.DeadBandExportW,
 		DeadBandImportW: cfg.Charge.DeadBandImportW,
 

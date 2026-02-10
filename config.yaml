@@ -3,7 +3,7 @@ wattnode:
   baud: 19200
   unit_id: 1
   read_interval_sec: 10
-  scale_factor: 0.5  # Calibration: USB WattNode reads 2x vs Insight native
+  scale_factor: 0.5  # USB WattNode reads 2x actual — root cause TBD
 
 insight:
   host: 192.168.86.86
@@ -26,10 +26,8 @@ charge:
   max_per_inverter_w: 4000
   max_total_w: 16000
   export_start_w: 1000
-  export_ramp_w: 1000
-  import_trim_w: 2000
-  trim_buffer_w: 500
-  hold_sec: 600
+  ramp_up_hold_sec: 30
+  ramp_down_hold_sec: 300
   dead_band_export_w: 1000
   dead_band_import_w: 2000
 
@@ -51,7 +49,7 @@ logging:
   file: /var/log/solarcontrol.log
 
 telegram:
-  bot_token: ""
-  chat_id: ""
+  bot_token: "8084227300:AAHlBMq_BPYhw-o3FoAJlfgBBluaL7mpiJg"
+  chat_id: "5283618710"
   poll_timeout_sec: 30
   manual_step_w: 300

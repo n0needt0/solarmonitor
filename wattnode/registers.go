@@ -23,6 +23,7 @@ const (
 	RegCtAmpsB        uint16 = 1604 // CT rated amps Phase B (uint16)
 	RegCtAmpsC        uint16 = 1605 // CT rated amps Phase C (uint16)
 	RegConnectionType uint16 = 1610 // 1=1P2W, 2=1P3W (split-phase), 3=3P4W
+	RegPhaseOffset    uint16 = 1618 // Phase offset in degrees (120=3-phase, 180=split-phase)
 	RegConfigStart    uint16 = 1602 // Start of config block for bulk read
 )
 

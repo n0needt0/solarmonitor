@@ -58,10 +58,10 @@ type ChargeConfig struct {
 	StartPerInvW     int `yaml:"start_per_inverter_w"`
 	MaxPerInvW       int `yaml:"max_per_inverter_w"`
 	MaxTotalW        int `yaml:"max_total_w"`
-	ExportStartW     int `yaml:"export_start_w"`
-	TrimBufferW      int `yaml:"trim_buffer_w"`
-	HoldSec          int `yaml:"hold_sec"`
-	DeadBandExportW  int `yaml:"dead_band_export_w"`
+	ExportStartW      int `yaml:"export_start_w"`
+	RampUpHoldSec     int `yaml:"ramp_up_hold_sec"`
+	RampDownHoldSec   int `yaml:"ramp_down_hold_sec"`
+	DeadBandExportW   int `yaml:"dead_band_export_w"`
 	DeadBandImportW  int `yaml:"dead_band_import_w"`
 }
 

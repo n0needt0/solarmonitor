@@ -155,11 +155,11 @@ func (r *Reader) ReadDiagConfig() (*DiagConfig, error) {
 	}
 
 	// Config registers via function code 3 (holding registers)
-	// Read block 1602-1611 (10 registers)
-	cData, err := r.client.ReadHoldingRegisters(RegConfigStart, 10)
-	if err == nil && len(cData) >= 20 {
-		cfg.ConfigRegs = make([]uint16, 10)
-		for i := 0; i < 10; i++ {
+	// Read block 1602-1621 (20 registers) to include PhaseOffset and beyond
+	cData, err := r.client.ReadHoldingRegisters(RegConfigStart, 20)
+	if err == nil && len(cData) >= 40 {
+		cfg.ConfigRegs = make([]uint16, 20)
+		for i := 0; i < 20; i++ {
 			cfg.ConfigRegs[i] = uint16(cData[i*2])<<8 | uint16(cData[i*2+1])
 		}
 		cfg.CtAmpsA = cfg.ConfigRegs[1]        // 1603
