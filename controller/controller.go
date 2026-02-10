@@ -44,6 +44,9 @@ type Controller struct {
 	lastKeepaliveAt   time.Time
 	consecutiveFail   int
 
+	// Session statistics
+	stats *StatsTracker
+
 	// Control
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -101,6 +104,7 @@ func New(cfg *Config, ins *insight.Client, wn *wattnode.Reader) *Controller {
 		wattnode:  wn,
 		state:     NewStateManager(),
 		scheduler: NewScheduler(cfg.ChargeStartHour, cfg.ChargeEndHour),
+		stats:     NewStatsTracker(cfg.MaxPerInvW),
 		stopCh:    make(chan struct{}),
 	}
 }
@@ -108,6 +112,11 @@ func New(cfg *Config, ins *insight.Client, wn *wattnode.Reader) *Controller {
 // SetAlerter sets the notification handler for state changes
 func (c *Controller) SetAlerter(a Alerter) {
 	c.alerter = a
+}
+
+// Stats returns the session stats tracker
+func (c *Controller) Stats() *StatsTracker {
+	return c.stats
 }
 
 // Start begins the control loop
@@ -121,8 +130,10 @@ func (c *Controller) Start(ctx context.Context) error {
 	// Initial state based on time
 	desiredState := c.scheduler.DesiredState()
 	if desiredState == StateDayCharge {
+		c.stats.StartSession(SessionCharge, 0)
 		c.state.Transition(StateDayCharge, "startup in charge window")
 	} else {
+		c.stats.StartSession(SessionDischarge, 0)
 		c.state.Transition(StateNightDischarge, "startup in discharge window")
 	}
 
@@ -193,11 +204,15 @@ func (c *Controller) readGrid() {
 		return
 	}
 
+	now := time.Now()
+
 	c.mu.Lock()
 	c.gridPower = *power
-	c.lastGridAt = time.Now()
+	c.lastGridAt = now
 	c.consecutiveFail = 0
 	c.mu.Unlock()
+
+	c.stats.RecordGridReading(power.Total, now)
 
 	slog.Debug("grid_read",
 		"l1_w", power.L1,
@@ -347,9 +362,16 @@ func (c *Controller) readBMS() {
 	}
 
 	c.mu.Lock()
+	prevBMSAt := c.lastBMSAt
 	c.bmsStatus = bms
 	c.lastBMSAt = time.Now()
 	c.mu.Unlock()
+
+	// Integrate battery energy for stats
+	if !prevBMSAt.IsZero() {
+		intervalSec := time.Since(prevBMSAt).Seconds()
+		c.stats.RecordChargeEnergy(bms.TotalPower(), intervalSec)
+	}
 
 	slog.Debug("bms_read",
 		"soc", bms.SOC,
@@ -384,6 +406,7 @@ func (c *Controller) runControlCycle() {
 
 	case StateDayCharge:
 		c.runDayChargeLogic(gridPower)
+		c.stats.RecordMaxRateTime(c.currentChargeW, c.cfg.GridReadInterval.Seconds())
 
 	case StateNightDischarge:
 		c.runNightDischargeLogic(gridPower)
@@ -410,9 +433,18 @@ func (c *Controller) checkTimeTransitions() {
 		return
 	}
 
+	// Get current SOC for stats
+	soc := 0
+	c.mu.RLock()
+	if c.bmsStatus != nil {
+		soc = c.bmsStatus.TotalSOC()
+	}
+	c.mu.RUnlock()
+
 	// Time-based transitions
 	if c.scheduler.IsChargeWindow() {
 		if currentState != StateDayCharge {
+			c.stats.StartSession(SessionCharge, soc)
 			c.state.Transition(StateDayCharge, "entering charge window")
 			c.currentChargeW = 0 // Reset charge level
 			if err := c.applyCurrentState(); err != nil {
@@ -421,6 +453,7 @@ func (c *Controller) checkTimeTransitions() {
 		}
 	} else {
 		if currentState != StateNightDischarge && currentState != StateNightReduced {
+			c.stats.StartSession(SessionDischarge, soc)
 			c.state.Transition(StateNightDischarge, "entering discharge window")
 			if err := c.applyCurrentState(); err != nil {
 				slog.Error("failed to apply night discharge state", "error", err)
@@ -534,6 +567,7 @@ func (c *Controller) startCharging() {
 	}
 
 	c.currentChargeW = newChargeW
+	c.stats.RecordChargeRate(c.currentChargeW, true)
 
 	slog.Info("starting_charge",
 		"export_w", exportW,
@@ -591,6 +625,7 @@ func (c *Controller) rampUpCharge(gridW int) {
 
 		c.currentChargeW = newChargeW
 		c.lastRampAt = time.Now()
+		c.stats.RecordChargeRate(newChargeW, true)
 	}
 }
 
@@ -631,6 +666,7 @@ func (c *Controller) rampDownCharge(gridW int) {
 
 		c.currentChargeW = newChargeW
 		c.lastRampAt = time.Now()
+		c.stats.RecordChargeRate(newChargeW, false)
 	}
 }
 
@@ -672,6 +708,8 @@ func (c *Controller) nightExportDetected(grid wattnode.GridPower) {
 	}
 
 	c.state.AddIdledInverter(nextToIdle)
+	activeAfter := 4 - (idledCount + 1)
+	c.stats.RecordNightGuardEvent(nextToIdle, grid.L1, grid.L2, activeAfter)
 
 	// Transition to NIGHT_REDUCED after first idle
 	if c.state.Current() != StateNightReduced {
@@ -694,6 +732,14 @@ func (c *Controller) enterSafeMode(reason string) {
 		return
 	}
 
+	soc := 0
+	c.mu.RLock()
+	if c.bmsStatus != nil {
+		soc = c.bmsStatus.TotalSOC()
+	}
+	c.mu.RUnlock()
+	c.stats.EndSession(soc)
+
 	slog.Error("entering_safe_mode", "reason", reason)
 	c.state.Transition(StateSafe, reason)
 
@@ -706,6 +752,15 @@ func (c *Controller) enterSafeMode(reason string) {
 // ManualStop stops all charging/discharging
 func (c *Controller) ManualStop() {
 	slog.Info("manual_stop_requested")
+
+	soc := 0
+	c.mu.RLock()
+	if c.bmsStatus != nil {
+		soc = c.bmsStatus.TotalSOC()
+	}
+	c.mu.RUnlock()
+	c.stats.EndSession(soc)
+
 	c.state.Transition(StateStopped, "manual stop")
 
 	if err := c.insight.IdleAllInverters(c.cfg.AllUnitIDs()); err != nil {
@@ -717,8 +772,21 @@ func (c *Controller) ManualStop() {
 func (c *Controller) ManualStart() {
 	slog.Info("manual_start_requested")
 
+	soc := 0
+	c.mu.RLock()
+	if c.bmsStatus != nil {
+		soc = c.bmsStatus.TotalSOC()
+	}
+	c.mu.RUnlock()
+
 	// Transition back to time-appropriate state
 	desiredState := c.scheduler.DesiredState()
+	sessionType := SessionDischarge
+	if desiredState == StateDayCharge {
+		sessionType = SessionCharge
+	}
+	c.stats.StartSession(sessionType, soc)
+
 	c.state.Transition(desiredState, "manual start")
 
 	if err := c.applyCurrentState(); err != nil {

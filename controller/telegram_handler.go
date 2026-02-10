@@ -156,6 +156,62 @@ func (h *TelegramHandler) HandleDown() string {
 	}
 }
 
+// HandleStats returns session statistics
+func (h *TelegramHandler) HandleStats() string {
+	var current, lastCharge, lastDischarge *telegram.SessionStatsData
+
+	if s := h.ctrl.Stats().CurrentSession(); s != nil {
+		d := toStatsData(s)
+		// For in-progress session, use current SOC as EndSOC
+		status := h.ctrl.Status()
+		if status.BMSStatus != nil {
+			d.EndSOC = status.BMSStatus.TotalSOC()
+		}
+		current = &d
+	}
+	if s := h.ctrl.Stats().LastCharge(); s != nil {
+		d := toStatsData(s)
+		lastCharge = &d
+	}
+	if s := h.ctrl.Stats().LastDischarge(); s != nil {
+		d := toStatsData(s)
+		lastDischarge = &d
+	}
+
+	return telegram.FormatStats(current, lastCharge, lastDischarge)
+}
+
+func toStatsData(s *SessionStats) telegram.SessionStatsData {
+	d := telegram.SessionStatsData{
+		Type:                 s.Type.String(),
+		StartTime:            s.StartTime,
+		EndTime:              s.EndTime,
+		StartSOC:             s.StartSOC,
+		EndSOC:               s.EndSOC,
+		TotalEnergyWh:        s.TotalEnergyWh,
+		GridEnergyWh:         s.GridEnergyWh,
+		AvgGridPowerW:        s.AvgGridPowerW(),
+		PeakChargePerInvW:    s.PeakChargePerInvW,
+		PeakChargeTotalW:     s.PeakChargeTotalW,
+		RampUpCount:          s.RampUpCount,
+		RampDownCount:        s.RampDownCount,
+		TimeAtMaxSec:         s.TimeAtMaxSec,
+		MaxRollingExport5min: s.MaxRollingExport5min,
+		MaxRollingImport5min: s.MaxRollingImport5min,
+		MaxRollingExport1min: s.MaxRollingExport1min,
+	}
+	for _, ev := range s.NightGuardEvents {
+		d.NightGuardEvents = append(d.NightGuardEvents, telegram.NightGuardEventData{
+			Time:        ev.Time,
+			UnitID:      ev.UnitID,
+			L1Before:    ev.L1Before,
+			L2Before:    ev.L2Before,
+			ActiveAfter: ev.ActiveAfter,
+		})
+	}
+	return d
+}
+
 // SendModeChangeAlert sends mode change notification
 func (h *TelegramHandler) SendModeChangeAlert(state string, detail string) {
 	status := h.ctrl.Status()

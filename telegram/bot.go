@@ -39,6 +39,7 @@ type CommandHandler interface {
 	HandleStart() string
 	HandleUp() string
 	HandleDown() string
+	HandleStats() string
 }
 
 // Update represents a Telegram update
@@ -221,6 +222,10 @@ func (b *Bot) handleUpdate(update Update) {
 	case "/down":
 		slog.Info("telegram_cmd", "cmd", "down")
 		response = b.handler.HandleDown()
+
+	case "/stats":
+		slog.Info("telegram_cmd", "cmd", "stats")
+		response = b.handler.HandleStats()
 
 	default:
 		// Unknown command - ignore

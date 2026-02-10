@@ -160,3 +160,115 @@ func formatDuration(d time.Duration) string {
 	}
 	return fmt.Sprintf("%dm", m)
 }
+
+// NightGuardEventData holds one night guard event for display
+type NightGuardEventData struct {
+	Time        time.Time
+	UnitID      byte
+	L1Before    float32
+	L2Before    float32
+	ActiveAfter int
+}
+
+// SessionStatsData holds session stats for telegram display
+type SessionStatsData struct {
+	Type      string
+	StartTime time.Time
+	EndTime   time.Time
+	StartSOC  int
+	EndSOC    int
+
+	TotalEnergyWh float64
+	GridEnergyWh  float64
+	AvgGridPowerW float64
+
+	// Charge fields
+	PeakChargePerInvW    int
+	PeakChargeTotalW     int
+	RampUpCount          int
+	RampDownCount        int
+	TimeAtMaxSec         float64
+	MaxRollingExport5min float64
+	MaxRollingImport5min float64
+
+	// Discharge fields
+	MaxRollingExport1min float64
+	NightGuardEvents     []NightGuardEventData
+}
+
+// FormatStats formats the /stats response from current, lastCharge, lastDischarge
+func FormatStats(current, lastCharge, lastDischarge *SessionStatsData) string {
+	if current == nil && lastCharge == nil && lastDischarge == nil {
+		return "No session data yet"
+	}
+
+	msg := ""
+	if current != nil {
+		msg += formatSessionBlock("CURRENT (in progress)", current)
+	}
+	if lastCharge != nil {
+		if msg != "" {
+			msg += "\n"
+		}
+		msg += formatSessionBlock("LAST CHARGE (completed)", lastCharge)
+	}
+	if lastDischarge != nil {
+		if msg != "" {
+			msg += "\n"
+		}
+		msg += formatSessionBlock("LAST DISCHARGE (completed)", lastDischarge)
+	}
+	return msg
+}
+
+func formatSessionBlock(label string, s *SessionStatsData) string {
+	msg := fmt.Sprintf("-- %s --\n", label)
+	msg += fmt.Sprintf("  %s  %s\n", s.Type, s.StartTime.Format("15:04"))
+
+	if !s.EndTime.IsZero() {
+		msg += fmt.Sprintf("  End: %s\n", s.EndTime.Format("15:04"))
+	}
+
+	dur := s.EndTime.Sub(s.StartTime)
+	if s.EndTime.IsZero() {
+		dur = time.Since(s.StartTime)
+	}
+	msg += fmt.Sprintf("  Duration: %s\n", formatDuration(dur))
+	msg += fmt.Sprintf("  SOC: %d%% -> %d%%\n", s.StartSOC, s.EndSOC)
+	msg += fmt.Sprintf("  Energy: %.1f kWh\n", s.TotalEnergyWh/1000)
+
+	// Grid energy: negative = net export
+	gridKWh := s.GridEnergyWh / 1000
+	msg += fmt.Sprintf("  Grid: %.1f kWh (avg %+.0fW)\n", gridKWh, s.AvgGridPowerW)
+
+	if s.Type == "CHARGE" {
+		if s.PeakChargeTotalW > 0 {
+			msg += fmt.Sprintf("  Peak: %dW/inv (%dW total)\n", s.PeakChargePerInvW, s.PeakChargeTotalW)
+		}
+		msg += fmt.Sprintf("  Ramps: %d up / %d down\n", s.RampUpCount, s.RampDownCount)
+		if s.TimeAtMaxSec > 0 {
+			msg += fmt.Sprintf("  At max: %s\n", formatDuration(time.Duration(s.TimeAtMaxSec)*time.Second))
+		}
+		if s.MaxRollingExport5min > 0 {
+			msg += fmt.Sprintf("  Max 5m avg export: %.1fkW\n", s.MaxRollingExport5min/1000)
+		}
+		if s.MaxRollingImport5min > 0 {
+			msg += fmt.Sprintf("  Max 5m avg import: %.1fkW\n", s.MaxRollingImport5min/1000)
+		}
+	}
+
+	if s.Type == "DISCHARGE" {
+		if s.MaxRollingExport1min > 0 {
+			msg += fmt.Sprintf("  Max 1m avg export: %.0fW\n", s.MaxRollingExport1min)
+		}
+		if len(s.NightGuardEvents) > 0 {
+			msg += fmt.Sprintf("  Guard events: %d\n", len(s.NightGuardEvents))
+			for _, ev := range s.NightGuardEvents {
+				msg += fmt.Sprintf("    %s inv%d L1:%+.0f L2:%+.0f -> %d active\n",
+					ev.Time.Format("15:04"), ev.UnitID, ev.L1Before, ev.L2Before, ev.ActiveAfter)
+			}
+		}
+	}
+
+	return msg
+}
