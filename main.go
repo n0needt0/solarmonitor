@@ -45,6 +45,7 @@ func main() {
 		cfg.WattNode.Port,
 		cfg.WattNode.Baud,
 		cfg.WattNode.UnitID,
+		cfg.WattNode.ScaleFactor,
 	)
 	if err != nil {
 		slog.Error("failed to connect to WattNode", "error", err)
@@ -76,6 +77,18 @@ func main() {
 			slog.Error("failed to idle inverters", "error", err)
 			// Continue anyway - not fatal
 		}
+	}
+
+	// Read WattNode voltages for diagnostics
+	diag, err := wn.ReadDiagConfig()
+	if err != nil {
+		slog.Error("failed to read WattNode diag", "error", err)
+	} else {
+		slog.Info("wattnode diag",
+			"voltage_a", diag.VoltageA,
+			"voltage_b", diag.VoltageB,
+			"scale_factor", cfg.WattNode.ScaleFactor,
+		)
 	}
 
 	// Test WattNode read

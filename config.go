@@ -21,10 +21,11 @@ type Config struct {
 }
 
 type WattNodeConfig struct {
-	Port            string `yaml:"port"`
-	Baud            int    `yaml:"baud"`
-	UnitID          byte   `yaml:"unit_id"`
-	ReadIntervalSec int    `yaml:"read_interval_sec"`
+	Port            string  `yaml:"port"`
+	Baud            int     `yaml:"baud"`
+	UnitID          byte    `yaml:"unit_id"`
+	ReadIntervalSec int     `yaml:"read_interval_sec"`
+	ScaleFactor     float32 `yaml:"scale_factor"`
 }
 
 type InsightConfig struct {

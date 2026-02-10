@@ -3,6 +3,7 @@ wattnode:
   baud: 19200
   unit_id: 1
   read_interval_sec: 10
+  scale_factor: 0.5  # Calibration: USB WattNode reads 2x vs Insight native
 
 insight:
   host: 192.168.86.86

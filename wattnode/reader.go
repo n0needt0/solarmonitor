@@ -12,10 +12,11 @@ import (
 
 // Reader handles USB Modbus RTU communication with WattNode meter
 type Reader struct {
-	handler *modbus.RTUClientHandler
-	client  modbus.Client
-	unitID  byte
-	mu      sync.Mutex
+	handler     *modbus.RTUClientHandler
+	client      modbus.Client
+	unitID      byte
+	scaleFactor float32
+	mu          sync.Mutex
 
 	// Latest reading
 	lastPower GridPower
@@ -27,7 +28,10 @@ type Reader struct {
 }
 
 // NewReader creates a WattNode reader for USB serial connection
-func NewReader(port string, baud int, unitID byte) (*Reader, error) {
+func NewReader(port string, baud int, unitID byte, scaleFactor float32) (*Reader, error) {
+	if scaleFactor == 0 {
+		scaleFactor = 1.0
+	}
 	handler := modbus.NewRTUClientHandler(port)
 	handler.BaudRate = baud
 	handler.DataBits = 8
@@ -41,9 +45,10 @@ func NewReader(port string, baud int, unitID byte) (*Reader, error) {
 	}
 
 	return &Reader{
-		handler: handler,
-		client:  modbus.NewClient(handler),
-		unitID:  unitID,
+		handler:     handler,
+		client:      modbus.NewClient(handler),
+		unitID:      unitID,
+		scaleFactor: scaleFactor,
 	}, nil
 }
 
@@ -79,8 +84,9 @@ func (r *Reader) Read() (*GridPower, error) {
 	// Parse Float32 values (standard Big Endian)
 	// Negate values - USB WattNode CTs have reversed polarity
 	// Convention: Positive = importing, Negative = exporting
-	l1 := -parseFloat32BE(l1Data)
-	l2 := -parseFloat32BE(l2Data)
+	// Apply scale factor for CT ratio calibration
+	l1 := -parseFloat32BE(l1Data) * r.scaleFactor
+	l2 := -parseFloat32BE(l2Data) * r.scaleFactor
 	// Total register (1015) not reliable on this meter - calculate from L1+L2
 	r.lastPower = GridPower{
 		L1:    l1,
@@ -92,6 +98,31 @@ func (r *Reader) Read() (*GridPower, error) {
 	r.consecutiveFailures = 0
 
 	return &r.lastPower, nil
+}
+
+// DiagConfig holds WattNode voltage readings for diagnostics
+type DiagConfig struct {
+	VoltageA float32
+	VoltageB float32
+}
+
+// ReadDiagConfig reads WattNode voltage registers for diagnostics
+func (r *Reader) ReadDiagConfig() (*DiagConfig, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	cfg := &DiagConfig{}
+
+	vData, err := r.client.ReadInputRegisters(RegVoltageA, 2)
+	if err == nil {
+		cfg.VoltageA = parseFloat32BE(vData)
+	}
+	vData, err = r.client.ReadInputRegisters(RegVoltageB, 2)
+	if err == nil {
+		cfg.VoltageB = parseFloat32BE(vData)
+	}
+
+	return cfg, nil
 }
 
 // LastReading returns the most recent reading without making a new request
