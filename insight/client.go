@@ -50,56 +50,83 @@ func (c *Client) Connect() error {
 
 // connectLocked does the actual connection (must hold lock)
 func (c *Client) connectLocked() error {
-	// Close existing connections if any
+	if err := c.connectReadLocked(); err != nil {
+		return err
+	}
+	if err := c.connectWriteLocked(); err != nil {
+		c.readHandler.Close()
+		return err
+	}
+	c.connected = true
+	return nil
+}
+
+// connectReadLocked reconnects read handler only (must hold lock)
+func (c *Client) connectReadLocked() error {
 	if c.readHandler != nil {
 		c.readHandler.Close()
 	}
-	if c.writeHandler != nil {
-		c.writeHandler.Close()
-	}
-
-	// Read port (503)
 	c.readHandler = modbus.NewTCPClientHandler(fmt.Sprintf("%s:%d", c.host, c.readPort))
 	c.readHandler.Timeout = time.Duration(c.timeoutMs) * time.Millisecond
 	if err := c.readHandler.Connect(); err != nil {
 		return fmt.Errorf("connect read port %d: %w", c.readPort, err)
 	}
 	c.readClient = modbus.NewClient(c.readHandler)
-
-	// Write port (502)
-	c.writeHandler = modbus.NewTCPClientHandler(fmt.Sprintf("%s:%d", c.host, c.writePort))
-	c.writeHandler.Timeout = time.Duration(c.timeoutMs) * time.Millisecond
-	if err := c.writeHandler.Connect(); err != nil {
-		c.readHandler.Close()
-		return fmt.Errorf("connect write port %d: %w", c.writePort, err)
-	}
-	c.writeClient = modbus.NewClient(c.writeHandler)
-
-	c.connected = true
 	return nil
 }
 
-// reconnectIfNeeded checks for connection errors and reconnects
-// Returns true if reconnection was successful
-func (c *Client) reconnectIfNeeded(err error) bool {
+// connectWriteLocked reconnects write handler only (must hold lock)
+func (c *Client) connectWriteLocked() error {
+	if c.writeHandler != nil {
+		c.writeHandler.Close()
+	}
+	c.writeHandler = modbus.NewTCPClientHandler(fmt.Sprintf("%s:%d", c.host, c.writePort))
+	c.writeHandler.Timeout = time.Duration(c.timeoutMs) * time.Millisecond
+	if err := c.writeHandler.Connect(); err != nil {
+		return fmt.Errorf("connect write port %d: %w", c.writePort, err)
+	}
+	c.writeClient = modbus.NewClient(c.writeHandler)
+	return nil
+}
+
+// isConnectionError returns true if err indicates a dropped connection
+func isConnectionError(err error) bool {
 	if err == nil {
 		return false
 	}
-
 	errStr := err.Error()
-	if strings.Contains(errStr, "broken pipe") ||
+	return strings.Contains(errStr, "broken pipe") ||
 		strings.Contains(errStr, "EOF") ||
 		strings.Contains(errStr, "connection reset") ||
-		strings.Contains(errStr, "connection refused") {
-		slog.Warn("insight connection lost, reconnecting", "error", err)
-		if reconnErr := c.connectLocked(); reconnErr != nil {
-			slog.Error("insight reconnect failed", "error", reconnErr)
-			return false
-		}
-		slog.Info("insight reconnected")
-		return true
+		strings.Contains(errStr, "connection refused")
+}
+
+// reconnectRead reconnects only the read handler. Returns true if successful.
+func (c *Client) reconnectRead(err error) bool {
+	if !isConnectionError(err) {
+		return false
 	}
-	return false
+	slog.Debug("read connection lost, reconnecting", "error", err)
+	if reconnErr := c.connectReadLocked(); reconnErr != nil {
+		slog.Error("read reconnect failed", "error", reconnErr)
+		return false
+	}
+	slog.Debug("read connection restored")
+	return true
+}
+
+// reconnectWrite reconnects only the write handler. Returns true if successful.
+func (c *Client) reconnectWrite(err error) bool {
+	if !isConnectionError(err) {
+		return false
+	}
+	slog.Debug("write connection lost, reconnecting", "error", err)
+	if reconnErr := c.connectWriteLocked(); reconnErr != nil {
+		slog.Error("write reconnect failed", "error", reconnErr)
+		return false
+	}
+	slog.Debug("write connection restored")
+	return true
 }
 
 // Close closes both connections
@@ -145,7 +172,7 @@ func (c *Client) ReadRegister(unitID byte, register uint16) (uint16, error) {
 		data, err := c.readClient.ReadHoldingRegisters(register, 1)
 		if err != nil {
 			c.lastErr = err
-			if c.reconnectIfNeeded(err) && attempt == 0 {
+			if c.reconnectRead(err) && attempt == 0 {
 				continue
 			}
 			return 0, fmt.Errorf("read register %d from unit %d: %w", register, unitID, err)
@@ -170,7 +197,7 @@ func (c *Client) ReadHoldingRegisters(unitID byte, startRegister uint16, count u
 		data, err := c.readClient.ReadHoldingRegisters(startRegister, count)
 		if err != nil {
 			c.lastErr = err
-			if c.reconnectIfNeeded(err) && attempt == 0 {
+			if c.reconnectRead(err) && attempt == 0 {
 				continue
 			}
 			return nil, fmt.Errorf("read holding registers %d-%d from unit %d: %w", startRegister, startRegister+count-1, unitID, err)
@@ -195,7 +222,6 @@ func (c *Client) WriteRegister(unitID byte, register uint16, value uint16) error
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Try up to 2 times (initial + 1 retry after reconnect)
 	for attempt := 0; attempt < 2; attempt++ {
 		c.waitForGap()
 
@@ -205,8 +231,7 @@ func (c *Client) WriteRegister(unitID byte, register uint16, value uint16) error
 
 		if err != nil {
 			c.lastErr = err
-			if c.reconnectIfNeeded(err) && attempt == 0 {
-				// Reconnected, retry once
+			if c.reconnectWrite(err) && attempt == 0 {
 				continue
 			}
 			return fmt.Errorf("write register %d = %d to unit %d: %w", register, value, unitID, err)

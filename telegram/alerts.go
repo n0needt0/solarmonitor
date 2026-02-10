@@ -57,18 +57,16 @@ func FormatStatus(d StatusData) string {
 	msg += fmt.Sprintf("L1: %+.0fW  L2: %+.0fW\n\n", d.GridL1, d.GridL2)
 
 	// Per-inverter table
-	totalActual := 0
-	for _, inv := range d.Inverters {
-		status := ""
+	for i, inv := range d.Inverters {
 		if inv.Idled {
-			status = " IDLE"
+			msg += fmt.Sprintf("Inv%d SOC %d%% IDLE\n", i+1, inv.SOC)
+		} else {
+			msg += fmt.Sprintf("Inv%d SOC %d%% %+dW of %dW\n",
+				i+1, inv.SOC, inv.ActualW, inv.TargetW)
 		}
-		msg += fmt.Sprintf("#%d  SOC:%3d%%  actual:%+5dW  target:%4dW%s\n",
-			inv.UnitID, inv.SOC, inv.ActualW, inv.TargetW, status)
-		totalActual += inv.ActualW
 	}
 
-	msg += fmt.Sprintf("Avg SOC: %d%%  Total: %+dW\n", d.AvgSOC, totalActual)
+	msg += fmt.Sprintf("Avg SOC: %d%%\n", d.AvgSOC)
 	msg += fmt.Sprintf("Uptime:  %s", formatDuration(d.Uptime))
 
 	return msg
