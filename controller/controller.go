@@ -679,17 +679,22 @@ func (c *Controller) rampUpCharge(gridW int) {
 
 // rampDownCharge decreases charge rate by fixed step, never stops completely
 func (c *Controller) rampDownCharge(gridW int) {
-	// Check hold time (slow ramp down — ride through clouds)
+	// Check hold time
 	if time.Since(c.lastRampAt) < time.Duration(c.cfg.RampDownHoldSec)*time.Second {
 		return
 	}
 
-	// Drop by fixed step (600W total = 150W/inv)
-	const trimStepW = 600
+	// Trim by half the overshoot — converges in ~3-5 writes, keeps floor
+	const trimBufferW = 500
 	currentTotalW := c.currentChargeW * 4
-	newTotalW := currentTotalW - trimStepW
+	overshoot := gridW - trimBufferW // gridW is positive (importing), keep 500W import buffer
+	trimW := overshoot / 2
+	if trimW < 600 {
+		trimW = 600 // minimum trim step
+	}
+	newTotalW := currentTotalW - trimW
 
-	// Never go below starting rate — keep charging
+	// Floor at starting rate
 	minTotalW := c.cfg.StartPerInvW * 4
 	if newTotalW < minTotalW {
 		newTotalW = minTotalW
@@ -700,6 +705,7 @@ func (c *Controller) rampDownCharge(gridW int) {
 	if newChargeW != c.currentChargeW {
 		slog.Info("ramp_down_charge",
 			"grid_w", gridW,
+			"overshoot_w", overshoot,
 			"from_per_inv_w", c.currentChargeW,
 			"to_per_inv_w", newChargeW,
 			"total_w", newChargeW*4,
@@ -711,8 +717,8 @@ func (c *Controller) rampDownCharge(gridW int) {
 				return
 			}
 		}
-
 		c.currentChargeW = newChargeW
+
 		c.lastRampAt = time.Now()
 		c.stats.RecordChargeRate(newChargeW, false)
 	}
