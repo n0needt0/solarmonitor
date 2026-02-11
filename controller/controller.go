@@ -46,6 +46,9 @@ type Controller struct {
 	consecutiveFail   int
 	starvationAt      time.Time // When we first saw low power at floor rate
 
+	// Night resume tracking
+	highLoadSince time.Time // When we first saw high import in NIGHT_REDUCED
+
 	// Session statistics
 	stats *StatsTracker
 
@@ -768,6 +771,50 @@ func (c *Controller) runNightReducedLogic(grid wattnode.GridPower) {
 	if grid.L1 < float32(-c.cfg.LegExportThresholdW) ||
 		grid.L2 < float32(-c.cfg.LegExportThresholdW) {
 		c.nightExportDetected(grid)
+		c.highLoadSince = time.Time{} // reset resume timer on any export
+		return
+	}
+
+	// Resume logic: if importing > 3.5kW sustained for 5 min, resume one inverter
+	const resumeImportW = 3500
+	const resumeHoldDur = 5 * time.Minute
+
+	idled := c.state.IdledInverters()
+	if len(idled) == 0 {
+		// All resumed — transition back to NIGHT_DISCHARGE
+		c.state.Transition(StateNightDischarge, "all inverters resumed")
+		c.highLoadSince = time.Time{}
+		return
+	}
+
+	if grid.Total > float32(resumeImportW) && grid.L1 >= 0 && grid.L2 >= 0 {
+		if c.highLoadSince.IsZero() {
+			c.highLoadSince = time.Now()
+			slog.Info("night_resume_timer_started",
+				"import_w", grid.Total,
+				"idled_count", len(idled),
+			)
+		} else if time.Since(c.highLoadSince) >= resumeHoldDur {
+			// Resume the last-idled inverter
+			unitID, ok := c.state.RemoveLastIdledInverter()
+			if ok {
+				slog.Info("night_resume_inverter",
+					"unit", unitID,
+					"import_w", grid.Total,
+					"remaining_idled", len(idled)-1,
+				)
+				if err := c.insight.SetDischargeMode(unitID, uint16(c.cfg.DischargePerInvW)); err != nil {
+					slog.Error("failed to resume inverter", "unit", unitID, "error", err)
+					c.state.AddIdledInverter(unitID) // put it back
+				}
+			}
+			c.highLoadSince = time.Time{} // reset for next inverter
+		}
+	} else {
+		// Load dropped or a leg went negative — reset timer
+		if !c.highLoadSince.IsZero() {
+			c.highLoadSince = time.Time{}
+		}
 	}
 }
 

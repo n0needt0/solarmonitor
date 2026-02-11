@@ -137,6 +137,19 @@ func (sm *StateManager) AddIdledInverter(unitID byte) {
 	sm.idledInverters = append(sm.idledInverters, unitID)
 }
 
+// RemoveLastIdledInverter removes the most recently idled inverter and returns its unit ID.
+// Returns 0, false if no inverters are idled.
+func (sm *StateManager) RemoveLastIdledInverter() (byte, bool) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if len(sm.idledInverters) == 0 {
+		return 0, false
+	}
+	last := sm.idledInverters[len(sm.idledInverters)-1]
+	sm.idledInverters = sm.idledInverters[:len(sm.idledInverters)-1]
+	return last, true
+}
+
 // StateChangeCh returns the channel that receives state changes
 func (sm *StateManager) StateChangeCh() <-chan StateChange {
 	return sm.stateChangeCh
