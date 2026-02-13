@@ -45,7 +45,7 @@ func (h *TelegramHandler) HandleStatus() string {
 		case StateDayCharge:
 			inv.TargetW = status.ChargeW
 		case StateNightDischarge, StateNightReduced:
-			inv.TargetW = h.ctrl.cfg.DischargePerInvW
+			inv.TargetW = status.DischargeW
 		}
 
 		for _, idledID := range idled {
