@@ -46,10 +46,22 @@ type Controller struct {
 	consecutiveFail   int
 	starvationAt      time.Time // When we first saw low power at floor rate
 
+	// Day peak shave tracking
+	dayDischargeSince time.Time // When sustained high import started during day
+	dayDischarging    bool      // Currently peak shaving (discharging during day)
+
+	// Manual override: skip time-based transitions until window boundary or /start /stop
+	manualOverride      bool
+	manualOverrideInDay bool // true if override was set during charge window
+	manualStopped       bool // true if stopped by /stop command (don't auto-resume)
+
 	// Night discharge tracking
-	currentDischargeW  int       // Current discharge rate per inverter
-	dischargeRampSince time.Time // When we first saw high import for discharge ramp
-	highLoadSince      time.Time // When we first saw high import in NIGHT_REDUCED
+	currentDischargeW   int       // Current discharge rate per inverter
+	preGuardDischargeW  int       // Rate before first guard reduction
+	dischargeGuardCount int       // Number of guard reduction events (0-4)
+	dischargeRampSince  time.Time // When we first saw high import for discharge ramp
+	highLoadSince       time.Time // When we first saw high import in NIGHT_REDUCED
+	resumeBelowCount    int       // Consecutive readings below resume threshold
 
 	// Session statistics
 	stats *StatsTracker
@@ -276,52 +288,24 @@ func (c *Controller) sendKeepalive() {
 
 	switch state {
 	case StateDayCharge:
-		// Re-send current charge level with balancing
-		if c.currentChargeW > 0 {
+		if c.dayDischarging {
+			if c.currentDischargeW > 0 {
+				if err := c.writeDischargeRates(c.currentDischargeW); err != nil {
+					slog.Warn("keepalive day discharge failed", "error", err)
+				}
+			}
+		} else if c.currentChargeW > 0 {
 			if err := c.writeChargeRates(c.currentChargeW); err != nil {
 				slog.Warn("keepalive charge failed", "error", err)
 			}
 		}
 		c.lastKeepaliveAt = time.Now()
 
-	case StateNightDischarge:
-		// Re-send discharge mode (EPC=2) and limit to active inverters
-		idled := c.state.IdledInverters()
-		for _, id := range c.cfg.AllUnitIDs() {
-			isIdled := false
-			for _, idledID := range idled {
-				if id == idledID {
-					isIdled = true
-					break
-				}
-			}
-			if !isIdled {
-				if err := c.insight.SetDischargeMode(id, uint16(c.currentDischargeW)); err != nil {
-					slog.Warn("keepalive discharge failed", "unit", id, "error", err)
-				}
-			}
-		}
-		c.lastKeepaliveAt = time.Now()
-
-	case StateNightReduced:
-		// Re-send current state - some discharging, some idled
-		idled := c.state.IdledInverters()
-		for _, id := range c.cfg.AllUnitIDs() {
-			isIdled := false
-			for _, idledID := range idled {
-				if id == idledID {
-					isIdled = true
-					break
-				}
-			}
-			if isIdled {
-				if err := c.insight.SetIdleMode(id); err != nil {
-					slog.Warn("keepalive idle failed", "unit", id, "error", err)
-				}
-			} else {
-				if err := c.insight.SetDischargeMode(id, uint16(c.currentDischargeW)); err != nil {
-					slog.Warn("keepalive discharge failed", "unit", id, "error", err)
-				}
+	case StateNightDischarge, StateNightReduced:
+		// Re-send discharge rates with SOC balancing
+		if c.currentDischargeW > 0 {
+			if err := c.writeDischargeRates(c.currentDischargeW); err != nil {
+				slog.Warn("keepalive discharge failed", "error", err)
 			}
 		}
 		c.lastKeepaliveAt = time.Now()
@@ -433,9 +417,30 @@ func (c *Controller) runControlCycle() {
 func (c *Controller) checkTimeTransitions() {
 	currentState := c.state.Current()
 
-	// Don't override STOPPED or SAFE states
-	if currentState == StateStopped || currentState == StateSafe {
+	// SAFE: never auto-resume
+	if currentState == StateSafe {
 		return
+	}
+
+	// STOPPED: auto-resume on charge window only if not manually stopped
+	if currentState == StateStopped {
+		if !c.manualStopped && c.scheduler.IsChargeWindow() {
+			slog.Info("stopped_auto_resume", "reason", "charge window opened")
+		} else {
+			return
+		}
+	}
+
+	// Manual override: hold until the time window actually changes from when override was set
+	if c.manualOverride {
+		inChargeNow := c.scheduler.IsChargeWindow()
+		if inChargeNow == c.manualOverrideInDay {
+			// Same window as when override was set — keep holding
+			return
+		}
+		// Window boundary crossed — clear override and fall through to normal transition
+		slog.Info("manual_override_cleared", "reason", "window boundary crossed")
+		c.manualOverride = false
 	}
 
 	// Get current SOC for stats
@@ -457,7 +462,7 @@ func (c *Controller) checkTimeTransitions() {
 			}
 		}
 	} else {
-		if currentState != StateNightDischarge && currentState != StateNightReduced && currentState != StateStopped {
+		if currentState != StateNightDischarge && currentState != StateNightReduced {
 			const minDischargeSOC = 30
 			if soc > 0 && soc < minDischargeSOC {
 				slog.Info("discharge_skipped_low_soc",
@@ -495,6 +500,9 @@ func (c *Controller) applyCurrentState() error {
 		// Don't start charging immediately - wait for export > threshold
 		c.currentChargeW = 0
 		c.waitingForExport = true
+		c.dischargeGuardCount = 0
+		c.dayDischarging = false
+		c.dayDischargeSince = time.Time{}
 		slog.Info("waiting_for_export", "threshold_w", c.cfg.ExportStartW)
 		// Inverters stay idle until we see enough export
 		return c.insight.IdleAllInverters(unitIDs)
@@ -502,13 +510,9 @@ func (c *Controller) applyCurrentState() error {
 	case StateNightDischarge:
 		// Set EPC mode to discharge (2) and set discharge limit on all inverters
 		c.currentDischargeW = c.cfg.DischargePerInvW
+		c.dischargeGuardCount = 0
 		c.dischargeRampSince = time.Time{}
-		for _, id := range unitIDs {
-			if err := c.insight.SetDischargeMode(id, uint16(c.currentDischargeW)); err != nil {
-				return err
-			}
-		}
-		return nil
+		return c.writeDischargeRates(c.currentDischargeW)
 
 	case StateNightReduced:
 		// Already handled by night guard logic
@@ -535,6 +539,81 @@ func (c *Controller) runDayChargeLogic(grid wattnode.GridPower) {
 	if gridW < 0 {
 		exportW = -gridW
 	}
+
+	// --- Day peak shave: discharge during expensive day hours ---
+	const dayDischargeImportW = 5000
+	const dayDischargeHoldDur = 30 * time.Minute
+	const dayDischargeMinSOC = 50
+	const maxDayDischargePerInvW = 1200
+
+	soc := 0
+	c.mu.RLock()
+	if c.bmsStatus != nil {
+		soc = c.bmsStatus.TotalSOC()
+	}
+	c.mu.RUnlock()
+
+	if c.dayDischarging {
+		// Currently peak shaving — check exit conditions
+		if exportW >= c.cfg.ExportStartW {
+			// Solar returned — switch back to charging
+			c.stopDayDischarge()
+			c.waitingForExport = false
+			c.startCharging()
+			return
+		}
+		if soc > 0 && soc <= dayDischargeMinSOC {
+			// SOC floor reached — stop discharging, wait for solar
+			c.stopDayDischarge()
+			return
+		}
+
+		// Match import: discharge to zero out grid, hold between adjustments
+		if time.Since(c.lastRampAt) >= time.Duration(c.cfg.RampUpHoldSec)*time.Second {
+			newPerInvW := gridW / 4
+			if newPerInvW > maxDayDischargePerInvW {
+				newPerInvW = maxDayDischargePerInvW
+			}
+			if newPerInvW <= 0 {
+				// No longer importing — stop peak shave
+				c.stopDayDischarge()
+				return
+			}
+			if newPerInvW != c.currentDischargeW {
+				c.currentDischargeW = newPerInvW
+				if err := c.writeDischargeRates(newPerInvW); err != nil {
+					slog.Error("day discharge adjust failed", "error", err)
+				}
+				c.lastRampAt = time.Now()
+				slog.Info("day_discharge_adjust",
+					"import_w", gridW,
+					"per_inv_w", newPerInvW,
+				)
+			}
+		}
+		return // skip normal charge logic while peak shaving
+	}
+
+	// Check if we should START peak shaving
+	// Only when: not charging (waiting for export or starved), importing > 5kW, SOC > 50%
+	if (c.waitingForExport || c.currentChargeW == 0) &&
+		gridW > dayDischargeImportW &&
+		soc > dayDischargeMinSOC {
+		if c.dayDischargeSince.IsZero() {
+			c.dayDischargeSince = time.Now()
+			slog.Info("day_discharge_timer_started",
+				"import_w", gridW,
+				"soc", soc,
+			)
+		} else if time.Since(c.dayDischargeSince) >= dayDischargeHoldDur {
+			c.startDayDischarge(gridW, soc)
+			return
+		}
+	} else {
+		c.dayDischargeSince = time.Time{}
+	}
+
+	// --- Normal charge logic below ---
 
 	// If waiting for export > threshold to start charging
 	if c.waitingForExport {
@@ -588,6 +667,50 @@ func (c *Controller) runDayChargeLogic(grid wattnode.GridPower) {
 		if !c.starvationAt.IsZero() {
 			c.starvationAt = time.Time{}
 		}
+	}
+}
+
+// startDayDischarge begins peak shave discharge during day
+func (c *Controller) startDayDischarge(gridW int, soc int) {
+	perInvW := gridW / 4
+	if perInvW > 1200 {
+		perInvW = 1200
+	}
+	if perInvW < 100 {
+		perInvW = 100
+	}
+
+	c.dayDischarging = true
+	c.currentDischargeW = perInvW
+	c.currentChargeW = 0
+	c.dayDischargeSince = time.Time{}
+
+	if err := c.writeDischargeRates(perInvW); err != nil {
+		slog.Error("day discharge start failed", "error", err)
+	}
+	c.lastRampAt = time.Now()
+
+	slog.Info("day_discharge_start", "import_w", gridW, "per_inv_w", perInvW)
+	if c.alerter != nil {
+		c.alerter.SendModeChangeAlert("DAY_DISCHARGE",
+			fmt.Sprintf("peak shave %dW/inv, SOC %d%%", perInvW, soc))
+	}
+}
+
+// stopDayDischarge ends peak shave discharge, returns to waiting for export
+func (c *Controller) stopDayDischarge() {
+	c.dayDischarging = false
+	c.currentDischargeW = 0
+	c.dayDischargeSince = time.Time{}
+	c.waitingForExport = true
+
+	if err := c.insight.IdleAllInverters(c.cfg.AllUnitIDs()); err != nil {
+		slog.Error("failed to idle inverters on day discharge stop", "error", err)
+	}
+
+	slog.Info("day_discharge_stop")
+	if c.alerter != nil {
+		c.alerter.SendModeChangeAlert("DAY_CHARGE", "peak shave ended, waiting for export")
 	}
 }
 
@@ -820,6 +943,116 @@ func (c *Controller) writeChargeRates(perInvW int) error {
 	return nil
 }
 
+// balancedDischargeRates distributes totalW across 4 inverters weighted by SOC excess.
+// Master (index 0) is protected: its effective SOC is raised by 10% so it always
+// gets less discharge, preserving headroom above its 25% floor vs 15% for slaves.
+// If SOC spread is <= 5% (after adjustment), returns equal rates.
+func (c *Controller) balancedDischargeRates(perInvW int) [4]int {
+	var rates [4]int
+
+	c.mu.RLock()
+	bms := c.bmsStatus
+	c.mu.RUnlock()
+
+	if bms == nil || perInvW <= 0 {
+		for i := range rates {
+			rates[i] = perInvW
+		}
+		return rates
+	}
+
+	// Adjusted SOC: master gets -10% so it appears lower, receiving less discharge.
+	// This keeps master SOC ~10% above slaves, matching the 25% vs 15% floor gap.
+	const masterProtection = 10
+	adjSOC := [4]int{}
+	for i, s := range bms.SOC {
+		adjSOC[i] = s
+	}
+	adjSOC[0] -= masterProtection // index 0 = master appears lower → less discharge
+
+	minSOC, maxSOC := adjSOC[0], adjSOC[0]
+	for _, s := range adjSOC[1:] {
+		if s < minSOC {
+			minSOC = s
+		}
+		if s > maxSOC {
+			maxSOC = s
+		}
+	}
+
+	const balanceThreshold = 5
+	if maxSOC-minSOC <= balanceThreshold {
+		for i := range rates {
+			rates[i] = perInvW
+		}
+		return rates
+	}
+
+	// Weight by adjusted SOC excess: higher adjusted SOC gets more discharge
+	// excess = adjSOC - minSOC + 1 (avoid zero weight)
+	totalW := perInvW * 4
+	var totalWeight int
+	weights := [4]int{}
+	for i, s := range adjSOC {
+		weights[i] = s - minSOC + 1
+		totalWeight += weights[i]
+	}
+
+	const maxDischargePerInvW = 1200
+	var assigned int
+	for i := 0; i < 4; i++ {
+		rates[i] = totalW * weights[i] / totalWeight
+		if rates[i] > maxDischargePerInvW {
+			rates[i] = maxDischargePerInvW
+		}
+		if rates[i] < 0 {
+			rates[i] = 0
+		}
+		assigned += rates[i]
+	}
+
+	// Give remainder to highest adjusted SOC inverter (never master if tied)
+	if remainder := totalW - assigned; remainder > 0 {
+		highestIdx := 1 // start from first slave
+		for i := 1; i < 4; i++ {
+			if adjSOC[i] > adjSOC[highestIdx] {
+				highestIdx = i
+			}
+		}
+		rates[highestIdx] += remainder
+		if rates[highestIdx] > maxDischargePerInvW {
+			rates[highestIdx] = maxDischargePerInvW
+		}
+	}
+
+	slog.Info("balanced_discharge",
+		"soc", bms.SOC,
+		"adj_soc", adjSOC,
+		"spread", maxSOC-minSOC,
+		"rates", rates,
+	)
+
+	return rates
+}
+
+// writeDischargeRates writes per-inverter discharge rates using SOC balancing
+func (c *Controller) writeDischargeRates(perInvW int) error {
+	rates := c.balancedDischargeRates(perInvW)
+	unitIDs := c.cfg.AllUnitIDs()
+	for i, id := range unitIDs {
+		if rates[i] > 0 {
+			if err := c.insight.SetDischargeMode(id, uint16(rates[i])); err != nil {
+				return err
+			}
+		} else {
+			if err := c.insight.SetIdleMode(id); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // effectiveExportThreshold returns the per-leg export threshold based on time of day.
 // During solar hours (8am-5pm), tolerate 100W/leg from residual production.
 // Outside solar hours, use the configured threshold (50W noise tolerance).
@@ -833,13 +1066,16 @@ func (c *Controller) effectiveExportThreshold() int {
 
 // runNightDischargeLogic handles nighttime discharge monitoring
 func (c *Controller) runNightDischargeLogic(grid wattnode.GridPower) {
-	// Night guard: check each leg against effective threshold
-	threshold := c.effectiveExportThreshold()
-	if grid.L1 < float32(-threshold) ||
-		grid.L2 < float32(-threshold) {
-		c.nightExportDetected(grid)
-		c.dischargeRampSince = time.Time{}
-		return
+	// Skip night guard during manual override in charge window — solar export is expected
+	if !c.manualOverride || !c.scheduler.IsChargeWindow() {
+		// Night guard: check each leg against effective threshold
+		threshold := c.effectiveExportThreshold()
+		if grid.L1 < float32(-threshold) ||
+			grid.L2 < float32(-threshold) {
+			c.nightExportDetected(grid)
+			c.dischargeRampSince = time.Time{}
+			return
+		}
 	}
 
 	// Dynamic discharge ramp: if importing > 2kW for 5 min, increase by 100W/inv
@@ -871,10 +1107,8 @@ func (c *Controller) runNightDischargeLogic(grid wattnode.GridPower) {
 				"total_w", newW*4,
 			)
 			c.currentDischargeW = newW
-			for _, id := range c.cfg.AllUnitIDs() {
-				if err := c.insight.SetDischargeMode(id, uint16(newW)); err != nil {
-					slog.Error("discharge ramp write failed", "unit", id, "error", err)
-				}
+			if err := c.writeDischargeRates(newW); err != nil {
+				slog.Error("discharge ramp write failed", "error", err)
 			}
 			c.dischargeRampSince = time.Now() // reset for next step
 		}
@@ -885,7 +1119,8 @@ func (c *Controller) runNightDischargeLogic(grid wattnode.GridPower) {
 	}
 }
 
-// nightExportDetected handles export detection at night — idle inverters until no export
+// nightExportDetected handles export detection at night
+// Fast response: idle one inverter immediately, then rebalance all 4 at reduced rate
 func (c *Controller) nightExportDetected(grid wattnode.GridPower) {
 	slog.Warn("night_export_detected",
 		"l1_w", grid.L1,
@@ -893,86 +1128,121 @@ func (c *Controller) nightExportDetected(grid wattnode.GridPower) {
 		"total_w", grid.Total,
 	)
 
-	idledCount := len(c.state.IdledInverters())
-	if idledCount >= 4 {
-		// All already idled, nothing more to do
-		return
+	if c.dischargeGuardCount >= 4 {
+		return // already fully reduced
 	}
 
-	// Get next inverter to idle from idle_order
-	nextToIdle := c.cfg.IdleOrder[idledCount]
-
-	slog.Info("idling_inverter_for_export",
-		"unit", nextToIdle,
-		"idled_count", idledCount+1,
-	)
-
-	if err := c.insight.SetIdleMode(nextToIdle); err != nil {
-		slog.Error("failed to idle inverter", "unit", nextToIdle, "error", err)
-		return
+	// Snapshot rate before first reduction
+	if c.dischargeGuardCount == 0 {
+		c.preGuardDischargeW = c.currentDischargeW
 	}
 
-	c.state.AddIdledInverter(nextToIdle)
-	activeAfter := 4 - (idledCount + 1)
-	c.stats.RecordNightGuardEvent(nextToIdle, grid.L1, grid.L2, activeAfter)
+	c.dischargeGuardCount++
+	activeEquiv := 4 - c.dischargeGuardCount
 
-	// Transition to NIGHT_REDUCED after first idle
+	if activeEquiv <= 0 {
+		// Fully reduced — idle all
+		c.currentDischargeW = 0
+		for _, id := range c.cfg.AllUnitIDs() {
+			if err := c.insight.SetIdleMode(id); err != nil {
+				slog.Error("failed to idle inverter", "unit", id, "error", err)
+			}
+		}
+		slog.Info("night_guard_full_idle",
+			"guard_count", c.dischargeGuardCount,
+		)
+	} else {
+		// Step 1: idle one inverter immediately for fast export reduction
+		idleTarget := c.cfg.IdleOrder[c.dischargeGuardCount-1]
+		if err := c.insight.SetIdleMode(idleTarget); err != nil {
+			slog.Error("failed to idle inverter", "unit", idleTarget, "error", err)
+		}
+
+		// Step 2: rebalance — spread reduced total across all 4 with SOC balancing
+		c.currentDischargeW = c.preGuardDischargeW * activeEquiv / 4
+		slog.Info("night_guard_rebalance",
+			"guard_count", c.dischargeGuardCount,
+			"idled_fast", idleTarget,
+			"per_inv_w", c.currentDischargeW,
+			"total_w", c.currentDischargeW*4,
+		)
+		if err := c.writeDischargeRates(c.currentDischargeW); err != nil {
+			slog.Error("failed to rebalance discharge", "error", err)
+		}
+	}
+
+	c.stats.RecordNightGuardEvent(0, grid.L1, grid.L2, activeEquiv)
+
 	if c.state.Current() != StateNightReduced {
-		c.state.Transition(StateNightReduced, "leg export detected, idled inverter(s)")
+		c.state.Transition(StateNightReduced, fmt.Sprintf("leg export detected, reduced to %dW/inv", c.currentDischargeW))
 	}
 }
 
-// runNightReducedLogic monitors for continued export and idles more inverters
+// runNightReducedLogic monitors for continued export and reduces further if needed
 func (c *Controller) runNightReducedLogic(grid wattnode.GridPower) {
-	// Still monitoring for export — if export returns, idle the next inverter
-	threshold := c.effectiveExportThreshold()
-	if grid.L1 < float32(-threshold) ||
-		grid.L2 < float32(-threshold) {
-		c.nightExportDetected(grid)
-		c.highLoadSince = time.Time{} // reset resume timer on any export
-		return
+	// Skip night guard during manual override in charge window — solar export is expected
+	if !c.manualOverride || !c.scheduler.IsChargeWindow() {
+		// Still monitoring for export — if export returns, reduce further
+		threshold := c.effectiveExportThreshold()
+		if grid.L1 < float32(-threshold) ||
+			grid.L2 < float32(-threshold) {
+			c.nightExportDetected(grid)
+			c.highLoadSince = time.Time{}
+			c.resumeBelowCount = 0
+			return
+		}
 	}
 
-	// Resume logic: if importing > 2.5kW sustained for 5 min, resume one inverter
+	// Resume logic: if importing > 2.5kW sustained for 5 min, undo one guard reduction
 	const resumeImportW = 2500
 	const resumeHoldDur = 5 * time.Minute
 
-	idled := c.state.IdledInverters()
-	if len(idled) == 0 {
-		// All resumed — transition back to NIGHT_DISCHARGE
-		c.state.Transition(StateNightDischarge, "all inverters resumed")
+	if c.dischargeGuardCount <= 0 {
+		// Fully resumed — transition back to NIGHT_DISCHARGE
+		c.state.Transition(StateNightDischarge, "discharge fully restored")
 		c.highLoadSince = time.Time{}
+		c.resumeBelowCount = 0
 		return
 	}
 
 	if grid.Total > float32(resumeImportW) {
+		c.resumeBelowCount = 0
 		if c.highLoadSince.IsZero() {
 			c.highLoadSince = time.Now()
 			slog.Info("night_resume_timer_started",
 				"import_w", grid.Total,
-				"idled_count", len(idled),
+				"guard_count", c.dischargeGuardCount,
 			)
 		} else if time.Since(c.highLoadSince) >= resumeHoldDur {
-			// Resume the last-idled inverter
-			unitID, ok := c.state.RemoveLastIdledInverter()
-			if ok {
-				slog.Info("night_resume_inverter",
-					"unit", unitID,
-					"import_w", grid.Total,
-					"remaining_idled", len(idled)-1,
-				)
-					const resumePerInvW = 500
-				if err := c.insight.SetDischargeMode(unitID, uint16(resumePerInvW)); err != nil {
-					slog.Error("failed to resume inverter", "unit", unitID, "error", err)
-					c.state.AddIdledInverter(unitID) // put it back
-				}
+			// Undo one guard reduction — increase rate on all 4
+			c.dischargeGuardCount--
+			if c.dischargeGuardCount <= 0 {
+				c.currentDischargeW = c.preGuardDischargeW
+			} else {
+				c.currentDischargeW = c.preGuardDischargeW * (4 - c.dischargeGuardCount) / 4
 			}
-			c.highLoadSince = time.Time{} // reset for next inverter
+
+			slog.Info("night_resume_increase",
+				"import_w", grid.Total,
+				"guard_count", c.dischargeGuardCount,
+				"per_inv_w", c.currentDischargeW,
+				"total_w", c.currentDischargeW*4,
+			)
+
+			if err := c.writeDischargeRates(c.currentDischargeW); err != nil {
+				slog.Error("failed to resume discharge", "error", err)
+			}
+
+			c.highLoadSince = time.Time{} // reset for next step
 		}
 	} else {
-		// Load dropped or a leg went negative — reset timer
+		// Load dropped — require 3 consecutive readings below threshold to reset timer
 		if !c.highLoadSince.IsZero() {
-			c.highLoadSince = time.Time{}
+			c.resumeBelowCount++
+			if c.resumeBelowCount >= 3 {
+				c.highLoadSince = time.Time{}
+				c.resumeBelowCount = 0
+			}
 		}
 	}
 }
@@ -982,6 +1252,9 @@ func (c *Controller) enterSafeMode(reason string) {
 	if c.state.Current() == StateSafe {
 		return
 	}
+
+	c.dayDischarging = false
+	c.dayDischargeSince = time.Time{}
 
 	soc := 0
 	c.mu.RLock()
@@ -1004,6 +1277,11 @@ func (c *Controller) enterSafeMode(reason string) {
 func (c *Controller) ManualStop() {
 	slog.Info("manual_stop_requested")
 
+	c.manualStopped = true
+	c.manualOverride = false
+	c.dayDischarging = false
+	c.dayDischargeSince = time.Time{}
+
 	soc := 0
 	c.mu.RLock()
 	if c.bmsStatus != nil {
@@ -1022,6 +1300,9 @@ func (c *Controller) ManualStop() {
 // ManualStart resumes normal operation
 func (c *Controller) ManualStart() {
 	slog.Info("manual_start_requested")
+
+	c.manualStopped = false
+	c.manualOverride = false
 
 	soc := 0
 	c.mu.RLock()
@@ -1045,6 +1326,54 @@ func (c *Controller) ManualStart() {
 	}
 }
 
+// ManualCharge forces DAY_CHARGE state regardless of time window
+func (c *Controller) ManualCharge() {
+	slog.Info("manual_charge_requested")
+
+	c.manualOverride = true
+	c.manualOverrideInDay = c.scheduler.IsChargeWindow()
+	c.dayDischarging = false
+	c.dayDischargeSince = time.Time{}
+
+	soc := 0
+	c.mu.RLock()
+	if c.bmsStatus != nil {
+		soc = c.bmsStatus.TotalSOC()
+	}
+	c.mu.RUnlock()
+
+	c.stats.StartSession(SessionCharge, soc)
+	c.state.Transition(StateDayCharge, "manual charge")
+
+	if err := c.applyCurrentState(); err != nil {
+		slog.Error("failed to apply charge state", "error", err)
+	}
+}
+
+// ManualDischarge forces NIGHT_DISCHARGE state regardless of time window
+func (c *Controller) ManualDischarge() {
+	slog.Info("manual_discharge_requested")
+
+	c.manualOverride = true
+	c.manualOverrideInDay = c.scheduler.IsChargeWindow()
+	c.dayDischarging = false
+	c.dayDischargeSince = time.Time{}
+
+	soc := 0
+	c.mu.RLock()
+	if c.bmsStatus != nil {
+		soc = c.bmsStatus.TotalSOC()
+	}
+	c.mu.RUnlock()
+
+	c.stats.StartSession(SessionDischarge, soc)
+	c.state.Transition(StateNightDischarge, "manual discharge")
+
+	if err := c.applyCurrentState(); err != nil {
+		slog.Error("failed to apply discharge state", "error", err)
+	}
+}
+
 // setChargeRate sets charge rate on all inverters (for manual /up /down)
 func (c *Controller) setChargeRate(perInvW int) {
 	slog.Info("manual_charge_rate",
@@ -1058,6 +1387,21 @@ func (c *Controller) setChargeRate(perInvW int) {
 	}
 
 	c.currentChargeW = perInvW
+}
+
+// setDischargeRate sets discharge rate on all inverters (for manual /up /down)
+func (c *Controller) setDischargeRate(perInvW int) {
+	slog.Info("manual_discharge_rate",
+		"from_w", c.currentDischargeW,
+		"to_w", perInvW,
+	)
+
+	if err := c.writeDischargeRates(perInvW); err != nil {
+		slog.Error("failed to set discharge", "error", err)
+		return
+	}
+
+	c.currentDischargeW = perInvW
 }
 
 // Status returns current controller status
@@ -1076,6 +1420,7 @@ func (c *Controller) Status() ControllerStatus {
 		BMSAge:         time.Since(c.lastBMSAt),
 		ChargeW:        c.currentChargeW,
 		DischargeW:     c.currentDischargeW,
+		DayDischarging: c.dayDischarging,
 		IdledInverters: c.state.IdledInverters(),
 	}
 }
@@ -1092,5 +1437,6 @@ type ControllerStatus struct {
 	BMSAge         time.Duration
 	ChargeW        int
 	DischargeW     int
+	DayDischarging bool
 	IdledInverters []byte
 }

@@ -32,6 +32,7 @@ type StatusData struct {
 	GridTotal      float32
 	Inverters      [4]InverterData
 	ChargeW        int
+	DayDischarging bool
 	IdledInverters []byte
 	Uptime         time.Duration
 }
@@ -51,6 +52,9 @@ func FormatStatus(d StatusData) string {
 	}
 
 	msg := fmt.Sprintf("State:  %s (%s)\n", d.State, formatDuration(d.TimeInState))
+	if d.DayDischarging {
+		msg += "Peak shave active\n"
+	}
 	msg += fmt.Sprintf("Grid:   %s %.1fkW%s\n", gridStatus, gridAmount/1000, deadBand)
 	msg += fmt.Sprintf("L1: %+.0fW  L2: %+.0fW\n\n", d.GridL1, d.GridL2)
 

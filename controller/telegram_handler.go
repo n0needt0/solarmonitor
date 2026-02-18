@@ -30,7 +30,6 @@ func (h *TelegramHandler) HandleStatus() string {
 
 	currentState := h.ctrl.state.Current()
 	unitIDs := h.ctrl.cfg.AllUnitIDs()
-	idled := status.IdledInverters
 
 	var inverters [4]telegram.InverterData
 	for i, uid := range unitIDs {
@@ -43,17 +42,13 @@ func (h *TelegramHandler) HandleStatus() string {
 
 		switch currentState {
 		case StateDayCharge:
-			inv.TargetW = status.ChargeW
+			if status.DayDischarging {
+				inv.TargetW = -status.DischargeW
+			} else {
+				inv.TargetW = status.ChargeW
+			}
 		case StateNightDischarge, StateNightReduced:
 			inv.TargetW = status.DischargeW
-		}
-
-		for _, idledID := range idled {
-			if uid == idledID {
-				inv.Idled = true
-				inv.TargetW = 0
-				break
-			}
 		}
 
 		inverters[i] = inv
@@ -67,7 +62,8 @@ func (h *TelegramHandler) HandleStatus() string {
 		GridTotal:      status.GridPower.Total,
 		Inverters:      inverters,
 		ChargeW:        status.ChargeW,
-		IdledInverters: idled,
+		DayDischarging: status.DayDischarging,
+		IdledInverters: status.IdledInverters,
 		Uptime:         time.Since(h.startTime),
 	}
 
@@ -114,13 +110,16 @@ func (h *TelegramHandler) HandleUp() string {
 		h.ctrl.setChargeRate(newW)
 		return h.HandleStatus()
 
-	case StateNightReduced:
-		// Cannot increase in reduced mode
-		return "Cannot increase in NIGHT_REDUCED - only down allowed"
-
 	case StateNightDischarge:
-		// Could increase discharge but not implemented
-		return "Discharge rate is fixed at 600W/inverter"
+		newW := h.ctrl.currentDischargeW + h.stepW
+		if newW > 1200 {
+			return "Already at maximum discharge rate (1200W/inv)"
+		}
+		h.ctrl.setDischargeRate(newW)
+		return h.HandleStatus()
+
+	case StateNightReduced:
+		return "Cannot increase in NIGHT_REDUCED"
 
 	case StateStopped:
 		return "Controller is stopped. Use /start first"
@@ -145,8 +144,12 @@ func (h *TelegramHandler) HandleDown() string {
 		return h.HandleStatus()
 
 	case StateNightDischarge, StateNightReduced:
-		// Manual idle of next inverter
-		return "Use night guard for discharge reduction"
+		newW := h.ctrl.currentDischargeW - h.stepW
+		if newW < 0 {
+			newW = 0
+		}
+		h.ctrl.setDischargeRate(newW)
+		return h.HandleStatus()
 
 	case StateStopped:
 		return "Controller is stopped. Use /start first"
@@ -154,6 +157,18 @@ func (h *TelegramHandler) HandleDown() string {
 	default:
 		return "Cannot adjust in current state"
 	}
+}
+
+// HandleCharge forces charge mode regardless of time window
+func (h *TelegramHandler) HandleCharge() string {
+	h.ctrl.ManualCharge()
+	return h.HandleStatus()
+}
+
+// HandleDischarge forces discharge mode regardless of time window
+func (h *TelegramHandler) HandleDischarge() string {
+	h.ctrl.ManualDischarge()
+	return h.HandleStatus()
 }
 
 // HandleStats returns session statistics
