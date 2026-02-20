@@ -155,6 +155,20 @@ func FormatStarted(state string, gridL1, gridL2 float32, soc int) string {
 		now, action, gridTotal/1000, soc, state)
 }
 
+// FormatHelp returns the help text listing all commands
+func FormatHelp() string {
+	return `/status - Current state, grid, SOC, rates
+/stop - Idle all inverters (manual)
+/start - Resume normal operation
+/up - Increase charge/discharge +300W/inv
+/down - Decrease charge/discharge -300W/inv
+/charge - Force charge mode
+/discharge - Force discharge mode
+/stats - Session statistics
+/reboot - Reboot Insight gateway
+/help - This message`
+}
+
 func formatDuration(d time.Duration) string {
 	h := int(d.Hours())
 	m := int(d.Minutes()) % 60

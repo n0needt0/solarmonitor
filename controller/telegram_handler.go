@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"context"
+	"log/slog"
 	"time"
 
 	"github.com/n0needt0/solarcontrol/telegram"
@@ -112,8 +114,8 @@ func (h *TelegramHandler) HandleUp() string {
 
 	case StateNightDischarge:
 		newW := h.ctrl.currentDischargeW + h.stepW
-		if newW > 1200 {
-			return "Already at maximum discharge rate (1200W/inv)"
+		if newW > 1500 {
+			return "Already at maximum discharge rate (1500W/inv)"
 		}
 		h.ctrl.setDischargeRate(newW)
 		return h.HandleStatus()
@@ -169,6 +171,27 @@ func (h *TelegramHandler) HandleCharge() string {
 func (h *TelegramHandler) HandleDischarge() string {
 	h.ctrl.ManualDischarge()
 	return h.HandleStatus()
+}
+
+// HandleReboot triggers a gateway reboot via the web UI
+func (h *TelegramHandler) HandleReboot() string {
+	if h.ctrl.rebooter == nil {
+		return "Gateway rebooter not configured"
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		if err := h.ctrl.rebooter.Reboot(ctx); err != nil {
+			slog.Error("manual gateway reboot failed", "error", err)
+			h.bot.SendMessage("Gateway reboot failed: " + err.Error())
+			return
+		}
+		slog.Info("manual gateway reboot completed")
+		h.bot.SendMessage("Gateway reboot completed. Allow ~90s for it to come back.")
+	}()
+
+	return "Rebooting gateway... (takes ~15s)"
 }
 
 // HandleStats returns session statistics

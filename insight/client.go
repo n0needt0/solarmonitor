@@ -101,6 +101,15 @@ func isConnectionError(err error) bool {
 		strings.Contains(errStr, "connection refused")
 }
 
+// IsModbusException3 returns true if err is a Modbus exception 3 (illegal data value).
+// This typically indicates the gateway lost Xanbus communication to the inverters.
+func IsModbusException3(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "exception '3'")
+}
+
 // reconnectRead reconnects only the read handler. Returns true if successful.
 func (c *Client) reconnectRead(err error) bool {
 	if !isConnectionError(err) {

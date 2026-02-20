@@ -36,6 +36,8 @@ type InsightConfig struct {
 	TimeoutMs          int    `yaml:"timeout_ms"`
 	SOCReadIntervalSec int    `yaml:"soc_read_interval_sec"`
 	KeepaliveSec       int    `yaml:"keepalive_sec"`
+	GatewayUser        string `yaml:"gateway_user"`
+	GatewayPassword    string `yaml:"gateway_password"`
 }
 
 type InvertersConfig struct {

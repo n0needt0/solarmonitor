@@ -165,6 +165,17 @@ func main() {
 	// Create controller
 	ctrl := controller.New(ctrlCfg, ins, wn)
 
+	// Setup gateway rebooter if credentials configured
+	if cfg.Insight.GatewayUser != "" && cfg.Insight.GatewayPassword != "" {
+		rebooter := insight.NewGatewayRebooter(
+			cfg.Insight.Host,
+			cfg.Insight.GatewayUser,
+			cfg.Insight.GatewayPassword,
+		)
+		ctrl.SetRebooter(rebooter)
+		slog.Info("gateway rebooter configured", "host", cfg.Insight.Host)
+	}
+
 	// Create telegram bot
 	bot := telegram.NewBot(
 		cfg.Telegram.BotToken,

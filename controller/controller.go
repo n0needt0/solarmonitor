@@ -25,6 +25,7 @@ type Controller struct {
 	// Communication
 	insight  *insight.Client
 	wattnode *wattnode.Reader
+	rebooter *insight.GatewayRebooter
 
 	// State management
 	state     *StateManager
@@ -45,6 +46,7 @@ type Controller struct {
 	lastKeepaliveAt   time.Time
 	consecutiveFail   int
 	starvationAt      time.Time // When we first saw low power at floor rate
+	consecutiveWriteFail int    // Consecutive Modbus write failures (exception 3 = bus lost)
 
 	// Day peak shave tracking
 	dayDischargeSince time.Time // When sustained high import started during day
@@ -131,6 +133,11 @@ func New(cfg *Config, ins *insight.Client, wn *wattnode.Reader) *Controller {
 // SetAlerter sets the notification handler for state changes
 func (c *Controller) SetAlerter(a Alerter) {
 	c.alerter = a
+}
+
+// SetRebooter sets the gateway rebooter for automatic recovery
+func (c *Controller) SetRebooter(r *insight.GatewayRebooter) {
+	c.rebooter = r
 }
 
 // Stats returns the session stats tracker
@@ -279,24 +286,34 @@ func (c *Controller) controlLoop(ctx context.Context) {
 func (c *Controller) sendKeepalive() {
 	state := c.state.Current()
 
+	// In SAFE mode, periodically probe to see if gateway recovered
+	if state == StateSafe {
+		c.probeSafeModeRecovery()
+		return
+	}
+
 	// Only send keepalives in active states
-	if state == StateStopped || state == StateSafe || state == StateIdle {
+	if state == StateStopped || state == StateIdle {
 		return
 	}
 
 	slog.Debug("sending_keepalive", "state", state.String())
 
+	var keepaliveErr error
+
 	switch state {
 	case StateDayCharge:
 		if c.dayDischarging {
 			if c.currentDischargeW > 0 {
-				if err := c.writeDischargeRates(c.currentDischargeW); err != nil {
-					slog.Warn("keepalive day discharge failed", "error", err)
+				keepaliveErr = c.writeDischargeRates(c.currentDischargeW)
+				if keepaliveErr != nil {
+					slog.Warn("keepalive day discharge failed", "error", keepaliveErr)
 				}
 			}
 		} else if c.currentChargeW > 0 {
-			if err := c.writeChargeRates(c.currentChargeW); err != nil {
-				slog.Warn("keepalive charge failed", "error", err)
+			keepaliveErr = c.writeChargeRates(c.currentChargeW)
+			if keepaliveErr != nil {
+				slog.Warn("keepalive charge failed", "error", keepaliveErr)
 			}
 		}
 		c.lastKeepaliveAt = time.Now()
@@ -304,11 +321,76 @@ func (c *Controller) sendKeepalive() {
 	case StateNightDischarge, StateNightReduced:
 		// Re-send discharge rates with SOC balancing
 		if c.currentDischargeW > 0 {
-			if err := c.writeDischargeRates(c.currentDischargeW); err != nil {
-				slog.Warn("keepalive discharge failed", "error", err)
+			keepaliveErr = c.writeDischargeRates(c.currentDischargeW)
+			if keepaliveErr != nil {
+				slog.Warn("keepalive discharge failed", "error", keepaliveErr)
 			}
 		}
 		c.lastKeepaliveAt = time.Now()
+	}
+
+	// Track consecutive Modbus exception 3 — indicates gateway lost Xanbus to inverters
+	const maxWriteFail = 5
+	if keepaliveErr != nil && insight.IsModbusException3(keepaliveErr) {
+		c.consecutiveWriteFail++
+		slog.Warn("modbus_exception3",
+			"consecutive", c.consecutiveWriteFail,
+			"max", maxWriteFail,
+		)
+		if c.consecutiveWriteFail >= maxWriteFail {
+			// Try rebooting the gateway before entering SAFE mode
+			if c.rebooter != nil {
+				slog.Info("gateway_reboot_attempt", "reason", "modbus exception 3")
+				if c.alerter != nil {
+					c.alerter.SendFailureAlert(fmt.Sprintf("Modbus exception 3 x%d — rebooting gateway", c.consecutiveWriteFail))
+				}
+				rebootCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+				if err := c.rebooter.Reboot(rebootCtx); err != nil {
+					slog.Error("gateway_reboot_failed", "error", err)
+				} else {
+					slog.Info("gateway_reboot_success", "waiting", "90s for gateway to restart")
+					// Wait for gateway to come back, then probe
+					time.Sleep(90 * time.Second)
+				}
+				cancel()
+			}
+			c.enterSafeMode(fmt.Sprintf("Modbus exception 3 x%d — gateway lost Xanbus to inverters", c.consecutiveWriteFail))
+		}
+	} else if keepaliveErr == nil {
+		c.consecutiveWriteFail = 0
+	}
+}
+
+// probeSafeModeRecovery tries a test write to see if the gateway recovered
+func (c *Controller) probeSafeModeRecovery() {
+	// Try to idle unit 10 — if it works, gateway is back
+	err := c.insight.SetIdleMode(c.cfg.MasterUnitID)
+	if err != nil {
+		slog.Debug("safe_mode_probe_failed", "error", err)
+		return
+	}
+
+	slog.Info("safe_mode_probe_success", "unit", c.cfg.MasterUnitID)
+	c.consecutiveWriteFail = 0
+
+	// Recover: transition to time-appropriate state
+	soc := 0
+	c.mu.RLock()
+	if c.bmsStatus != nil {
+		soc = c.bmsStatus.TotalSOC()
+	}
+	c.mu.RUnlock()
+
+	desiredState := c.scheduler.DesiredState()
+	sessionType := SessionDischarge
+	if desiredState == StateDayCharge {
+		sessionType = SessionCharge
+	}
+	c.stats.StartSession(sessionType, soc)
+	c.state.Transition(desiredState, "gateway recovered")
+
+	if err := c.applyCurrentState(); err != nil {
+		slog.Error("failed to apply state on recovery", "error", err)
 	}
 }
 
@@ -544,7 +626,7 @@ func (c *Controller) runDayChargeLogic(grid wattnode.GridPower) {
 	const dayDischargeImportW = 5000
 	const dayDischargeHoldDur = 30 * time.Minute
 	const dayDischargeMinSOC = 50
-	const maxDayDischargePerInvW = 1200
+	const maxDayDischargePerInvW = 1500
 
 	soc := 0
 	c.mu.RLock()
@@ -673,8 +755,8 @@ func (c *Controller) runDayChargeLogic(grid wattnode.GridPower) {
 // startDayDischarge begins peak shave discharge during day
 func (c *Controller) startDayDischarge(gridW int, soc int) {
 	perInvW := gridW / 4
-	if perInvW > 1200 {
-		perInvW = 1200
+	if perInvW > 1500 {
+		perInvW = 1500
 	}
 	if perInvW < 100 {
 		perInvW = 100
@@ -925,22 +1007,30 @@ func (c *Controller) balancedChargeRates(perInvW int) [4]int {
 	return rates
 }
 
-// writeChargeRates writes per-inverter charge rates using SOC balancing
+// writeChargeRates writes per-inverter charge rates using SOC balancing.
+// Continues on individual inverter errors so one failure doesn't block the rest.
 func (c *Controller) writeChargeRates(perInvW int) error {
 	rates := c.balancedChargeRates(perInvW)
 	unitIDs := c.cfg.AllUnitIDs()
+	var firstErr error
 	for i, id := range unitIDs {
 		if rates[i] > 0 {
 			if err := c.insight.SetChargeMode(id, uint16(rates[i])); err != nil {
-				return err
+				slog.Warn("charge write failed", "unit", id, "rate", rates[i], "error", err)
+				if firstErr == nil {
+					firstErr = err
+				}
 			}
 		} else {
 			if err := c.insight.SetIdleMode(id); err != nil {
-				return err
+				slog.Warn("idle write failed", "unit", id, "error", err)
+				if firstErr == nil {
+					firstErr = err
+				}
 			}
 		}
 	}
-	return nil
+	return firstErr
 }
 
 // balancedDischargeRates distributes totalW across 4 inverters weighted by SOC excess.
@@ -998,7 +1088,7 @@ func (c *Controller) balancedDischargeRates(perInvW int) [4]int {
 		totalWeight += weights[i]
 	}
 
-	const maxDischargePerInvW = 1200
+	const maxDischargePerInvW = 1500
 	var assigned int
 	for i := 0; i < 4; i++ {
 		rates[i] = totalW * weights[i] / totalWeight
@@ -1035,22 +1125,30 @@ func (c *Controller) balancedDischargeRates(perInvW int) [4]int {
 	return rates
 }
 
-// writeDischargeRates writes per-inverter discharge rates using SOC balancing
+// writeDischargeRates writes per-inverter discharge rates using SOC balancing.
+// Continues on individual inverter errors so one failure doesn't block the rest.
 func (c *Controller) writeDischargeRates(perInvW int) error {
 	rates := c.balancedDischargeRates(perInvW)
 	unitIDs := c.cfg.AllUnitIDs()
+	var firstErr error
 	for i, id := range unitIDs {
 		if rates[i] > 0 {
 			if err := c.insight.SetDischargeMode(id, uint16(rates[i])); err != nil {
-				return err
+				slog.Warn("discharge write failed", "unit", id, "rate", rates[i], "error", err)
+				if firstErr == nil {
+					firstErr = err
+				}
 			}
 		} else {
 			if err := c.insight.SetIdleMode(id); err != nil {
-				return err
+				slog.Warn("idle write failed", "unit", id, "error", err)
+				if firstErr == nil {
+					firstErr = err
+				}
 			}
 		}
 	}
-	return nil
+	return firstErr
 }
 
 // effectiveExportThreshold returns the per-leg export threshold based on time of day.
@@ -1082,7 +1180,7 @@ func (c *Controller) runNightDischargeLogic(grid wattnode.GridPower) {
 	const dischargeRampImportW = 2000
 	const dischargeRampHoldDur = 5 * time.Minute
 	const dischargeRampStepW = 100
-	const maxDischargePerInvW = 1200
+	const maxDischargePerInvW = 1500
 
 	if c.currentDischargeW >= maxDischargePerInvW {
 		return // already at max
@@ -1255,6 +1353,7 @@ func (c *Controller) enterSafeMode(reason string) {
 
 	c.dayDischarging = false
 	c.dayDischargeSince = time.Time{}
+	c.consecutiveWriteFail = 0
 
 	soc := 0
 	c.mu.RLock()
