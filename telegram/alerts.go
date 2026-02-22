@@ -7,11 +7,9 @@ import (
 
 // AlertType constants for rate limiting
 const (
-	AlertModeChange    = "mode_change"
-	AlertNightReduced  = "night_reduced"
-	AlertBatteriesFull = "batteries_full"
-	AlertFailure       = "failure"
-	AlertRecovery      = "recovery"
+	AlertModeChange = "mode_change"
+	AlertFailure    = "failure"
+	AlertRecovery   = "recovery"
 )
 
 // InverterData holds per-inverter status
@@ -81,26 +79,6 @@ func FormatModeChange(state string, gridL1, gridL2 float32, soc int, detail stri
   SOC: %d%%
   %s`,
 		state, now, gridL1, gridL2, soc, detail)
-}
-
-// FormatNightReduced formats a night reduced alert
-func FormatNightReduced(gridL1Before, gridL2Before, gridL1After, gridL2After float32, soc int, activeCount int, idled []byte) string {
-	now := time.Now().Format("15:04")
-	return fmt.Sprintf(`→ NIGHT_REDUCED at %s
-  Grid: L1 %+.0fW L2 %+.0fW → L1 %+.0fW L2 %+.0fW
-  SOC: %d%%
-  Inverters: %d of 4 active (idled %v)`,
-		now, gridL1Before, gridL2Before, gridL1After, gridL2After, soc, activeCount, idled)
-}
-
-// FormatBatteriesFull formats a batteries full alert
-func FormatBatteriesFull(exportW float32, soc int) string {
-	now := time.Now().Format("15:04")
-	return fmt.Sprintf(`→ BATTERIES FULL at %s
-  Grid: exporting %.1fkW
-  SOC: %d%%
-  Charge: stopped (XW Pro)`,
-		now, -exportW/1000, soc)
 }
 
 // FormatFailure formats a failure alert

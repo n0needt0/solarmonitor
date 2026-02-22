@@ -262,17 +262,6 @@ func (h *TelegramHandler) SendModeChangeAlert(state string, detail string) {
 	h.bot.Alert(telegram.AlertModeChange, msg)
 }
 
-// SendNightReducedAlert sends night reduced notification
-func (h *TelegramHandler) SendNightReducedAlert(l1Before, l2Before, l1After, l2After float32, activeCount int, idled []byte) {
-	var avgSOC int
-	if h.ctrl.bmsStatus != nil {
-		avgSOC = h.ctrl.bmsStatus.TotalSOC()
-	}
-
-	msg := telegram.FormatNightReduced(l1Before, l2Before, l1After, l2After, avgSOC, activeCount, idled)
-	h.bot.AlertImmediate(msg) // Always send night reduced alerts
-}
-
 // SendFailureAlert sends failure notification
 func (h *TelegramHandler) SendFailureAlert(reason string) {
 	status := h.ctrl.Status()

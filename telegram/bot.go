@@ -266,7 +266,7 @@ func (b *Bot) SendMessage(text string) error {
 
 	url := fmt.Sprintf("%s%s/sendMessage", apiBase, b.token)
 
-	payload := map[string]interface{}{
+	payload := map[string]any{
 		"chat_id": b.chatID,
 		"text":    text,
 	}
@@ -314,14 +314,4 @@ func (b *Bot) Alert(alertType, message string) error {
 	return nil
 }
 
-// AlertImmediate sends an alert without rate limiting
-func (b *Bot) AlertImmediate(message string) error {
-	return b.SendMessage(message)
-}
 
-// ResetAlertLimit resets the rate limit for an alert type
-func (b *Bot) ResetAlertLimit(alertType string) {
-	b.mu.Lock()
-	delete(b.lastSent, alertType)
-	b.mu.Unlock()
-}

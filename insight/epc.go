@@ -65,16 +65,6 @@ func (c *Client) SetDischargeMode(unitID byte, powerW uint16) error {
 	return nil
 }
 
-// SetDischargeLimit sets the maximum discharge power for an inverter
-func (c *Client) SetDischargeLimit(unitID byte, powerW uint16) error {
-	slog.Debug("set_discharge_limit", "unit", unitID, "power_w", powerW)
-
-	if err := c.WriteRegister(unitID, RegEPCMaxDischarge, powerW); err != nil {
-		return fmt.Errorf("set discharge limit: %w", err)
-	}
-
-	return nil
-}
 
 // IdleAllInverters sets all inverters to idle mode
 func (c *Client) IdleAllInverters(unitIDs []byte) error {

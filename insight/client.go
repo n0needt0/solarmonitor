@@ -25,8 +25,6 @@ type Client struct {
 
 	mu          sync.Mutex
 	lastWriteAt time.Time
-	connected   bool
-	lastErr     error
 }
 
 // NewClient creates an Insight Modbus TCP client
@@ -57,7 +55,6 @@ func (c *Client) connectLocked() error {
 		c.readHandler.Close()
 		return err
 	}
-	c.connected = true
 	return nil
 }
 
@@ -154,8 +151,6 @@ func (c *Client) Close() error {
 			errs = append(errs, err)
 		}
 	}
-	c.connected = false
-
 	if len(errs) > 0 {
 		return fmt.Errorf("close errors: %v", errs)
 	}
@@ -180,7 +175,6 @@ func (c *Client) ReadRegister(unitID byte, register uint16) (uint16, error) {
 		c.readHandler.SlaveId = unitID
 		data, err := c.readClient.ReadHoldingRegisters(register, 1)
 		if err != nil {
-			c.lastErr = err
 			if c.reconnectRead(err) && attempt == 0 {
 				continue
 			}
@@ -205,7 +199,6 @@ func (c *Client) ReadHoldingRegisters(unitID byte, startRegister uint16, count u
 		c.readHandler.SlaveId = unitID
 		data, err := c.readClient.ReadHoldingRegisters(startRegister, count)
 		if err != nil {
-			c.lastErr = err
 			if c.reconnectRead(err) && attempt == 0 {
 				continue
 			}
@@ -239,7 +232,6 @@ func (c *Client) WriteRegister(unitID byte, register uint16, value uint16) error
 		c.lastWriteAt = time.Now()
 
 		if err != nil {
-			c.lastErr = err
 			if c.reconnectWrite(err) && attempt == 0 {
 				continue
 			}
@@ -250,16 +242,3 @@ func (c *Client) WriteRegister(unitID byte, register uint16, value uint16) error
 	return fmt.Errorf("write register failed after retry")
 }
 
-// IsConnected returns connection status
-func (c *Client) IsConnected() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.connected
-}
-
-// LastError returns the last error encountered
-func (c *Client) LastError() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.lastErr
-}
