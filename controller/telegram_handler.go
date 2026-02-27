@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -114,8 +115,8 @@ func (h *TelegramHandler) HandleUp() string {
 
 	case StateNightDischarge:
 		newW := h.ctrl.currentDischargeW + h.stepW
-		if newW > 1500 {
-			return "Already at maximum discharge rate (1500W/inv)"
+		if newW > h.ctrl.cfg.MaxDischargePerInvW {
+			return fmt.Sprintf("Already at maximum discharge rate (%dW/inv)", h.ctrl.cfg.MaxDischargePerInvW)
 		}
 		h.ctrl.setDischargeRate(newW)
 		return h.HandleStatus()

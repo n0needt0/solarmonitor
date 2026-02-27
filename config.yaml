@@ -33,6 +33,7 @@ charge:
 
 discharge:
   per_inverter_w: 600
+  max_per_inverter_w: 4000
 
 night_guard:
   leg_export_threshold_w: 0

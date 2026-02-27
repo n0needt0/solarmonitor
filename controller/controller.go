@@ -46,7 +46,8 @@ type Controller struct {
 	lastKeepaliveAt   time.Time
 	consecutiveFail   int
 	starvationAt      time.Time // When we first saw low power at floor rate
-	consecutiveWriteFail int    // Consecutive Modbus write failures (exception 3 = bus lost)
+	consecutiveWriteFail int       // Consecutive Modbus write failures (exception 3 = bus lost)
+	lastRebootAt         time.Time // Last gateway reboot attempt
 
 	// Day peak shave tracking
 	dayDischargeSince time.Time // When sustained high import started during day
@@ -95,7 +96,8 @@ type Config struct {
 	DeadBandImportW int
 
 	// Discharge
-	DischargePerInvW int
+	DischargePerInvW    int
+	MaxDischargePerInvW int
 
 	// Night guard
 	LegExportThresholdW int
@@ -355,14 +357,16 @@ func (c *Controller) sendKeepalive() {
 					c.alerter.SendFailureAlert(fmt.Sprintf("Modbus exception 3 x%d — rebooting gateway", c.consecutiveWriteFail))
 				}
 				rebootCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-				if err := c.rebooter.Reboot(rebootCtx); err != nil {
-					slog.Error("gateway_reboot_failed", "error", err)
-				} else {
-					slog.Info("gateway_reboot_success", "waiting", "90s for gateway to restart")
-					// Wait for gateway to come back, then probe
-					time.Sleep(90 * time.Second)
-				}
+				rebootErr := c.rebooter.Reboot(rebootCtx)
 				cancel()
+				if rebootErr != nil {
+					slog.Error("gateway_reboot_failed", "error", rebootErr)
+				} else {
+					slog.Info("gateway_reboot_success", "waiting", "3m for gateway to restart")
+					time.Sleep(3 * time.Minute)
+				}
+				// Set after sleep so retry interval starts from now
+				c.lastRebootAt = time.Now()
 			}
 			c.enterSafeMode(fmt.Sprintf("Modbus exception 3 x%d — gateway lost Xanbus to inverters", c.consecutiveWriteFail))
 		}
@@ -371,12 +375,36 @@ func (c *Controller) sendKeepalive() {
 	}
 }
 
-// probeSafeModeRecovery tries a test write to see if the gateway recovered
+// probeSafeModeRecovery tries a test write to see if the gateway recovered.
+// If probe fails and rebooter is available, retries gateway reboot every 10 minutes.
 func (c *Controller) probeSafeModeRecovery() {
 	// Try to idle unit 10 — if it works, gateway is back
 	err := c.insight.SetIdleMode(c.cfg.MasterUnitID)
 	if err != nil {
 		slog.Debug("safe_mode_probe_failed", "error", err)
+
+		// Retry gateway reboot every 5 minutes while in SAFE mode.
+		// After a successful reboot, wait 3 min for gateway to fully restart
+		// (boot + XanBus re-init) before probing or retrying.
+		const rebootRetryInterval = 5 * time.Minute
+		const rebootRecoveryWait = 3 * time.Minute
+		if c.rebooter != nil && time.Since(c.lastRebootAt) >= rebootRetryInterval {
+			slog.Info("gateway_reboot_retry", "last_attempt", c.lastRebootAt.Format("15:04:05"))
+			if c.alerter != nil {
+				c.alerter.SendFailureAlert("SAFE mode — retrying gateway reboot")
+			}
+			rebootCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			rebootErr := c.rebooter.Reboot(rebootCtx)
+			cancel()
+			if rebootErr != nil {
+				slog.Error("gateway_reboot_retry_failed", "error", rebootErr)
+			} else {
+				slog.Info("gateway_reboot_retry_success", "waiting", rebootRecoveryWait)
+				time.Sleep(rebootRecoveryWait)
+			}
+			// Set lastRebootAt after sleep so the full retry interval starts from now
+			c.lastRebootAt = time.Now()
+		}
 		return
 	}
 
@@ -612,7 +640,7 @@ func (c *Controller) runDayChargeLogic(grid wattnode.GridPower) {
 	const dayDischargeImportW = 2000
 	const dayDischargeHoldDur = 10 * time.Minute
 	const dayDischargeMinSOC = 20
-	const maxDayDischargePerInvW = 1500
+	maxDayDischargePerInvW := c.cfg.MaxDischargePerInvW
 
 	soc := c.currentSOC()
 
@@ -730,7 +758,7 @@ func (c *Controller) runDayChargeLogic(grid wattnode.GridPower) {
 
 // startDayDischarge begins peak shave discharge during day
 func (c *Controller) startDayDischarge(gridW int, soc int) {
-	perInvW := clamp(gridW/4, 100, 1500)
+	perInvW := clamp(gridW/4, 100, c.cfg.MaxDischargePerInvW)
 
 	c.dayDischarging = true
 	c.currentDischargeW = perInvW
@@ -1022,11 +1050,11 @@ func (c *Controller) balancedDischargeRates(perInvW int) [4]int {
 		totalWeight += weights[i]
 	}
 
-	const maxDischargePerInvW = 1500
+	maxDischPerInv := c.cfg.MaxDischargePerInvW
 	var assigned int
 	for i := range 4 {
 		rates[i] = totalW * weights[i] / totalWeight
-		rates[i] = min(rates[i], maxDischargePerInvW)
+		rates[i] = min(rates[i], maxDischPerInv)
 		rates[i] = max(rates[i], 0)
 		assigned += rates[i]
 	}
@@ -1039,7 +1067,7 @@ func (c *Controller) balancedDischargeRates(perInvW int) [4]int {
 				highestIdx = i
 			}
 		}
-		rates[highestIdx] = min(rates[highestIdx]+remainder, maxDischargePerInvW)
+		rates[highestIdx] = min(rates[highestIdx]+remainder, maxDischPerInv)
 	}
 
 	slog.Info("balanced_discharge",
@@ -1114,8 +1142,8 @@ func (c *Controller) runNightDischargeLogic(grid wattnode.GridPower) {
 		}
 	}
 
-	// TOU peak/off-peak rate transition (only if guard hasn't reduced us)
-	if c.dischargeGuardCount == 0 {
+	// TOU peak/off-peak rate transition (only if guard hasn't reduced us and no manual override)
+	if c.dischargeGuardCount == 0 && !c.manualOverride {
 		touRate := c.touDischargeRate()
 		if touRate != c.currentDischargeW {
 			slog.Info("tou_rate_change",
@@ -1134,9 +1162,8 @@ func (c *Controller) runNightDischargeLogic(grid wattnode.GridPower) {
 	const dischargeRampImportW = 2000
 	const dischargeRampHoldDur = 5 * time.Minute
 	const dischargeRampStepW = 100
-	const maxDischargePerInvW = 1500
 
-	if c.currentDischargeW >= maxDischargePerInvW {
+	if c.currentDischargeW >= c.cfg.MaxDischargePerInvW {
 		return // already at max
 	}
 
@@ -1148,7 +1175,7 @@ func (c *Controller) runNightDischargeLogic(grid wattnode.GridPower) {
 				"current_per_inv_w", c.currentDischargeW,
 			)
 		} else if time.Since(c.dischargeRampSince) >= dischargeRampHoldDur {
-			newW := min(c.currentDischargeW+dischargeRampStepW, maxDischargePerInvW)
+			newW := min(c.currentDischargeW+dischargeRampStepW, c.cfg.MaxDischargePerInvW)
 			slog.Info("discharge_ramp_up",
 				"import_w", grid.Total,
 				"from_per_inv_w", c.currentDischargeW,
@@ -1424,6 +1451,7 @@ func (c *Controller) setChargeRate(perInvW int) {
 	}
 
 	c.currentChargeW = perInvW
+	c.manualOverride = true
 }
 
 // setDischargeRate sets discharge rate on all inverters (for manual /up /down)
@@ -1439,6 +1467,7 @@ func (c *Controller) setDischargeRate(perInvW int) {
 	}
 
 	c.currentDischargeW = perInvW
+	c.manualOverride = true
 }
 
 // Status returns current controller status

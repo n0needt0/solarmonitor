@@ -68,7 +68,8 @@ type ChargeConfig struct {
 }
 
 type DischargeConfig struct {
-	PerInverterW int `yaml:"per_inverter_w"`
+	PerInverterW    int `yaml:"per_inverter_w"`
+	MaxPerInvW      int `yaml:"max_per_inverter_w"`
 }
 
 type NightGuardConfig struct {
@@ -132,6 +133,10 @@ func (c *Config) Validate() error {
 	}
 	if c.Charge.StartHour >= c.Charge.EndHour {
 		return fmt.Errorf("charge.start_hour must be before end_hour")
+	}
+	// Default discharge max to charge max (hardware limit per inverter)
+	if c.Discharge.MaxPerInvW == 0 {
+		c.Discharge.MaxPerInvW = c.Charge.MaxPerInvW
 	}
 	return nil
 }

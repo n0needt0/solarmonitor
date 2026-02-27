@@ -42,6 +42,13 @@ Dead bands prevent unnecessary Modbus writes to Insight. If the grid reading fal
 | Either leg < 0W (any export) | Idle inverters until export stops, lock (no resume), keep monitoring |
 | Importing (any amount) | No action, no write |
 
+## Credentials
+
+| System | Username | Password |
+|--------|----------|----------|
+| Insight Gateway Web UI | Admin | Admin.1234 |
+| Gateway API (HTTPS) | https://192.168.86.86 | POST /auth username=Admin&password=Admin.1234 |
+
 ## System
 
 | Component | Spec |

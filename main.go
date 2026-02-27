@@ -151,7 +151,8 @@ func main() {
 		DeadBandExportW: cfg.Charge.DeadBandExportW,
 		DeadBandImportW: cfg.Charge.DeadBandImportW,
 
-		DischargePerInvW: cfg.Discharge.PerInverterW,
+		DischargePerInvW:    cfg.Discharge.PerInverterW,
+		MaxDischargePerInvW: cfg.Discharge.MaxPerInvW,
 
 		LegExportThresholdW: cfg.NightGuard.LegExportThresholdW,
 		ResumeAllowed:       cfg.NightGuard.ResumeAllowed,
