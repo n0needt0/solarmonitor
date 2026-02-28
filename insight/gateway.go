@@ -92,6 +92,111 @@ func (g *GatewayRebooter) Reboot(ctx context.Context) error {
 	return nil
 }
 
+// devListResponse represents the DEVLIST response from the gateway API.
+type devListResponse struct {
+	Values []struct {
+		Value []devListEntry `json:"value"`
+	} `json:"values"`
+	OTK string `json:"OTK"`
+}
+
+type devListEntry struct {
+	Name       string            `json:"name"`
+	Instance   int               `json:"instance"`
+	IsActive   string            `json:"isActive"`
+	Attributes map[string]string `json:"attributes"`
+}
+
+// CycleInverters puts all XW Pro inverters into standby, waits, then sets them
+// back to operating. This resets the inverter's internal EPC state machine,
+// which can get stuck accepting Modbus writes without actually acting on them.
+func (g *GatewayRebooter) CycleInverters(ctx context.Context) error {
+	baseURL := fmt.Sprintf("https://%s", g.host)
+
+	// Step 1: Login
+	slog.Info("inverter_cycle_login", "host", g.host)
+	authBody := fmt.Sprintf("username=%s&password=%s&session=true", g.username, g.password)
+	session, err := g.postAPI(ctx, baseURL+"/auth", authBody, "", "")
+	if err != nil {
+		return fmt.Errorf("gateway login: %w", err)
+	}
+
+	var auth authResponse
+	if err := json.Unmarshal([]byte(session), &auth); err != nil {
+		return fmt.Errorf("gateway login parse: %w (body: %s)", err, session)
+	}
+	if auth.Session == "" {
+		return fmt.Errorf("gateway login: no session (body: %s)", session)
+	}
+
+	// Step 2: Get DEVLIST to find XW inverter instances
+	devResp, err := g.postAPI(ctx, baseURL+"/vars", "name=DEVLIST", auth.Session, "")
+	if err != nil {
+		return fmt.Errorf("get DEVLIST: %w", err)
+	}
+
+	var devList devListResponse
+	if err := json.Unmarshal([]byte(devResp), &devList); err != nil {
+		return fmt.Errorf("parse DEVLIST: %w (body: %.200s)", err, devResp)
+	}
+
+	// Extract XW instances (xanbus interface only)
+	var xwInstances []int
+	if len(devList.Values) > 0 {
+		for _, dev := range devList.Values[0].Value {
+			if dev.Name == "XW" && dev.Attributes["interface"] == "xanbus" && dev.IsActive == "true" {
+				xwInstances = append(xwInstances, dev.Instance)
+			}
+		}
+	}
+	if len(xwInstances) == 0 {
+		return fmt.Errorf("no active XW inverters found in DEVLIST")
+	}
+
+	otk := devList.OTK
+	slog.Info("inverter_cycle_found", "count", len(xwInstances), "instances", xwInstances)
+
+	// Step 3: Set all to standby (CFG_OPMODE = 2)
+	for _, inst := range xwInstances {
+		setBody := fmt.Sprintf("[%d]/XW/DEV/CFG_OPMODE= 2", inst)
+		resp, err := g.postAPI(ctx, baseURL+"/set", setBody, auth.Session, otk)
+		if err != nil {
+			return fmt.Errorf("set standby instance %d: %w", inst, err)
+		}
+		// Update OTK from response
+		var setResp varsResponse
+		if err := json.Unmarshal([]byte(resp), &setResp); err == nil && setResp.OTK != "" {
+			otk = setResp.OTK
+		}
+		slog.Info("inverter_standby", "instance", inst)
+	}
+
+	// Step 4: Wait for inverters to fully enter standby
+	slog.Info("inverter_cycle_waiting", "seconds", 10)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(10 * time.Second):
+	}
+
+	// Step 5: Set all back to operating (CFG_OPMODE = 3)
+	for _, inst := range xwInstances {
+		setBody := fmt.Sprintf("[%d]/XW/DEV/CFG_OPMODE= 3", inst)
+		resp, err := g.postAPI(ctx, baseURL+"/set", setBody, auth.Session, otk)
+		if err != nil {
+			return fmt.Errorf("set operating instance %d: %w", inst, err)
+		}
+		var setResp varsResponse
+		if err := json.Unmarshal([]byte(resp), &setResp); err == nil && setResp.OTK != "" {
+			otk = setResp.OTK
+		}
+		slog.Info("inverter_operating", "instance", inst)
+	}
+
+	slog.Info("inverter_cycle_complete", "count", len(xwInstances))
+	return nil
+}
+
 // postAPI sends a POST request to the gateway API.
 func (g *GatewayRebooter) postAPI(ctx context.Context, url, body, authToken, otk string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(body))

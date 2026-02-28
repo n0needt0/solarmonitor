@@ -5,10 +5,16 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/goburrow/modbus"
 )
+
+// operationTimeout is the hard deadline for any single Modbus call.
+// If the underlying TCP Read/Write hangs beyond this, the operation
+// is abandoned and the connection is replaced on the next call.
+const operationTimeout = 10 * time.Second
 
 // Client handles Modbus TCP communication with Insight Facility gateway
 type Client struct {
@@ -25,6 +31,7 @@ type Client struct {
 
 	mu          sync.Mutex
 	lastWriteAt time.Time
+	stuck       atomic.Bool // set when an operation timed out; forces reconnect on next call
 }
 
 // NewClient creates an Insight Modbus TCP client
@@ -86,7 +93,7 @@ func (c *Client) connectWriteLocked() error {
 	return nil
 }
 
-// isConnectionError returns true if err indicates a dropped connection
+// isConnectionError returns true if err indicates a dropped or stale connection
 func isConnectionError(err error) bool {
 	if err == nil {
 		return false
@@ -95,7 +102,10 @@ func isConnectionError(err error) bool {
 	return strings.Contains(errStr, "broken pipe") ||
 		strings.Contains(errStr, "EOF") ||
 		strings.Contains(errStr, "connection reset") ||
-		strings.Contains(errStr, "connection refused")
+		strings.Contains(errStr, "connection refused") ||
+		strings.Contains(errStr, "i/o timeout") ||
+		strings.Contains(errStr, "no route to host") ||
+		strings.Contains(errStr, "operation timed out")
 }
 
 // IsModbusException3 returns true if err is a Modbus exception 3 (illegal data value).
@@ -166,79 +176,163 @@ func (c *Client) waitForGap() {
 	}
 }
 
+// recoverIfStuck recreates both connections if a previous operation timed out.
+// Must hold c.mu.
+func (c *Client) recoverIfStuck() {
+	if !c.stuck.Load() {
+		return
+	}
+	slog.Warn("recovering from stuck operation — recreating connections")
+	// Don't Close old handlers — they're leaked (stuck goroutine still holds mb.mu).
+	// Just nil them out so connectXxxLocked creates fresh ones.
+	c.readHandler = nil
+	c.readClient = nil
+	c.writeHandler = nil
+	c.writeClient = nil
+	c.stuck.Store(false)
+
+	if err := c.connectLocked(); err != nil {
+		slog.Error("recovery reconnect failed", "error", err)
+	}
+}
+
 // ReadRegister reads a single holding register from an inverter
 func (c *Client) ReadRegister(unitID byte, register uint16) (uint16, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for attempt := 0; attempt < 2; attempt++ {
-		c.readHandler.SlaveId = unitID
-		data, err := c.readClient.ReadHoldingRegisters(register, 1)
-		if err != nil {
-			if c.reconnectRead(err) && attempt == 0 {
-				continue
-			}
-			return 0, fmt.Errorf("read register %d from unit %d: %w", register, unitID, err)
-		}
-
-		if len(data) < 2 {
-			return 0, fmt.Errorf("short response from unit %d", unitID)
-		}
-
-		return uint16(data[0])<<8 | uint16(data[1]), nil
+	type result struct {
+		val uint16
+		err error
 	}
-	return 0, fmt.Errorf("read register failed after retry")
+
+	ch := make(chan result, 1)
+	go func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		c.recoverIfStuck()
+
+		for attempt := 0; attempt < 2; attempt++ {
+			c.readHandler.SlaveId = unitID
+			data, err := c.readClient.ReadHoldingRegisters(register, 1)
+			if err != nil {
+				if c.reconnectRead(err) && attempt == 0 {
+					continue
+				}
+				ch <- result{0, fmt.Errorf("read register %d from unit %d: %w", register, unitID, err)}
+				return
+			}
+
+			if len(data) < 2 {
+				ch <- result{0, fmt.Errorf("short response from unit %d", unitID)}
+				return
+			}
+
+			ch <- result{uint16(data[0])<<8 | uint16(data[1]), nil}
+			return
+		}
+		ch <- result{0, fmt.Errorf("read register failed after retry")}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.val, r.err
+	case <-time.After(operationTimeout):
+		slog.Error("ReadRegister timeout — operation stuck, will reconnect on next call",
+			"unit", unitID, "register", register)
+		// Mark as stuck. The goroutine still holds c.mu but will eventually return
+		// when the TCP retransmit gives up. Next caller will wait for mu then recover.
+		c.stuck.Store(true)
+		return 0, fmt.Errorf("read register %d from unit %d: operation timeout (%v)", register, unitID, operationTimeout)
+	}
 }
 
 // ReadHoldingRegisters reads multiple consecutive holding registers
 func (c *Client) ReadHoldingRegisters(unitID byte, startRegister uint16, count uint16) ([]uint16, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for attempt := 0; attempt < 2; attempt++ {
-		c.readHandler.SlaveId = unitID
-		data, err := c.readClient.ReadHoldingRegisters(startRegister, count)
-		if err != nil {
-			if c.reconnectRead(err) && attempt == 0 {
-				continue
-			}
-			return nil, fmt.Errorf("read holding registers %d-%d from unit %d: %w", startRegister, startRegister+count-1, unitID, err)
-		}
-
-		expected := int(count * 2)
-		if len(data) < expected {
-			return nil, fmt.Errorf("short response from unit %d: got %d bytes, expected %d", unitID, len(data), expected)
-		}
-
-		result := make([]uint16, count)
-		for i := uint16(0); i < count; i++ {
-			result[i] = uint16(data[i*2])<<8 | uint16(data[i*2+1])
-		}
-		return result, nil
+	type result struct {
+		data []uint16
+		err  error
 	}
-	return nil, fmt.Errorf("read holding registers failed after retry")
+
+	ch := make(chan result, 1)
+	go func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		c.recoverIfStuck()
+
+		for attempt := 0; attempt < 2; attempt++ {
+			c.readHandler.SlaveId = unitID
+			data, err := c.readClient.ReadHoldingRegisters(startRegister, count)
+			if err != nil {
+				if c.reconnectRead(err) && attempt == 0 {
+					continue
+				}
+				ch <- result{nil, fmt.Errorf("read holding registers %d-%d from unit %d: %w", startRegister, startRegister+count-1, unitID, err)}
+				return
+			}
+
+			expected := int(count * 2)
+			if len(data) < expected {
+				ch <- result{nil, fmt.Errorf("short response from unit %d: got %d bytes, expected %d", unitID, len(data), expected)}
+				return
+			}
+
+			vals := make([]uint16, count)
+			for i := uint16(0); i < count; i++ {
+				vals[i] = uint16(data[i*2])<<8 | uint16(data[i*2+1])
+			}
+			ch <- result{vals, nil}
+			return
+		}
+		ch <- result{nil, fmt.Errorf("read holding registers failed after retry")}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.data, r.err
+	case <-time.After(operationTimeout):
+		slog.Error("ReadHoldingRegisters timeout — operation stuck, will reconnect on next call",
+			"unit", unitID, "start", startRegister, "count", count)
+		c.stuck.Store(true)
+		return nil, fmt.Errorf("read holding registers %d-%d from unit %d: operation timeout (%v)", startRegister, startRegister+count-1, unitID, operationTimeout)
+	}
 }
 
 // WriteRegister writes a single holding register to an inverter
 func (c *Client) WriteRegister(unitID byte, register uint16, value uint16) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	ch := make(chan error, 1)
+	go func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
 
-	for attempt := 0; attempt < 2; attempt++ {
-		c.waitForGap()
+		c.recoverIfStuck()
 
-		c.writeHandler.SlaveId = unitID
-		_, err := c.writeClient.WriteSingleRegister(register, value)
-		c.lastWriteAt = time.Now()
+		for attempt := 0; attempt < 2; attempt++ {
+			c.waitForGap()
 
-		if err != nil {
-			if c.reconnectWrite(err) && attempt == 0 {
-				continue
+			c.writeHandler.SlaveId = unitID
+			_, err := c.writeClient.WriteSingleRegister(register, value)
+			c.lastWriteAt = time.Now()
+
+			if err != nil {
+				if c.reconnectWrite(err) && attempt == 0 {
+					continue
+				}
+				ch <- fmt.Errorf("write register %d = %d to unit %d: %w", register, value, unitID, err)
+				return
 			}
-			return fmt.Errorf("write register %d = %d to unit %d: %w", register, value, unitID, err)
+			ch <- nil
+			return
 		}
-		return nil
-	}
-	return fmt.Errorf("write register failed after retry")
-}
+		ch <- fmt.Errorf("write register failed after retry")
+	}()
 
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(operationTimeout):
+		slog.Error("WriteRegister timeout — operation stuck, will reconnect on next call",
+			"unit", unitID, "register", register, "value", value)
+		c.stuck.Store(true)
+		return fmt.Errorf("write register %d = %d to unit %d: operation timeout (%v)", register, value, unitID, operationTimeout)
+	}
+}

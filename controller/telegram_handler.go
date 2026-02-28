@@ -195,6 +195,34 @@ func (h *TelegramHandler) HandleReboot() string {
 	return "Rebooting gateway... (takes ~15s)"
 }
 
+// HandleCycle triggers a standby/operating cycle on all inverters
+func (h *TelegramHandler) HandleCycle() string {
+	if h.ctrl.rebooter == nil {
+		return "Gateway rebooter not configured"
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		if err := h.ctrl.rebooter.CycleInverters(ctx); err != nil {
+			slog.Error("manual inverter cycle failed", "error", err)
+			h.bot.SendMessage("Inverter cycle failed: " + err.Error())
+			return
+		}
+		slog.Info("manual inverter cycle completed")
+
+		// Wait for inverters to initialize, then reapply state
+		time.Sleep(5 * time.Second)
+		if err := h.ctrl.applyCurrentState(); err != nil {
+			slog.Error("failed to reapply state after manual cycle", "error", err)
+		}
+
+		h.bot.SendMessage("Inverter cycle complete. State reapplied: " + h.ctrl.state.Current().String())
+	}()
+
+	return "Cycling all inverters standby → operating... (~15s)"
+}
+
 // HandleStats returns session statistics
 func (h *TelegramHandler) HandleStats() string {
 	var current, lastCharge, lastDischarge *telegram.SessionStatsData

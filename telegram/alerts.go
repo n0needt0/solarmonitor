@@ -144,6 +144,7 @@ func FormatHelp() string {
 /discharge - Force discharge mode
 /stats - Session statistics
 /reboot - Reboot Insight gateway
+/cycle - Standby/operating cycle all inverters
 /help - This message`
 }
 

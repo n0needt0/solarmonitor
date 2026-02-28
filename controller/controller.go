@@ -48,6 +48,8 @@ type Controller struct {
 	starvationAt      time.Time // When we first saw low power at floor rate
 	consecutiveWriteFail int       // Consecutive Modbus write failures (exception 3 = bus lost)
 	lastRebootAt         time.Time // Last gateway reboot attempt
+	lastCycleAt          time.Time // Last inverter standby cycle attempt
+	epcStuckSince        time.Time // When we first detected EPC stuck (writes OK but BMS power 0)
 
 	// Day peak shave tracking
 	dayDischargeSince time.Time // When sustained high import started during day
@@ -372,6 +374,149 @@ func (c *Controller) sendKeepalive() {
 		}
 	} else if keepaliveErr == nil {
 		c.consecutiveWriteFail = 0
+
+		// EPC stuck detection: writes succeed but BMS shows zero power.
+		// This means the gateway accepts Modbus writes but the XW Pro's internal
+		// EPC controller is not acting on them. Only a standby cycle fixes it.
+		c.checkEPCStuck()
+	}
+}
+
+// checkEPCStuck detects when writes succeed but inverters aren't responding.
+// If BMS total power is near zero for 3+ minutes while we're commanding
+// charge or discharge, trigger a standby cycle.
+func (c *Controller) checkEPCStuck() {
+	state := c.state.Current()
+
+	// Only check in active charge/discharge states with a commanded rate
+	var commandedRate int
+	switch state {
+	case StateDayCharge:
+		if c.dayDischarging {
+			commandedRate = c.currentDischargeW
+		} else {
+			commandedRate = c.currentChargeW
+		}
+	case StateNightDischarge, StateNightReduced:
+		commandedRate = c.currentDischargeW
+	default:
+		c.epcStuckSince = time.Time{}
+		return
+	}
+
+	if commandedRate == 0 {
+		c.epcStuckSince = time.Time{}
+		return
+	}
+
+	// Check BMS power
+	c.mu.RLock()
+	bms := c.bmsStatus
+	bmsAge := time.Since(c.lastBMSAt)
+	c.mu.RUnlock()
+
+	if bms == nil || bmsAge > 2*time.Minute {
+		// No BMS data or stale — can't detect
+		return
+	}
+
+	// Skip when batteries are nearly full (charging) or nearly empty (discharging).
+	// At extreme SOC the BMS limits power to near-zero — that's normal, not stuck.
+	avgSOC := bms.TotalSOC()
+	isCharging := state == StateDayCharge && !c.dayDischarging
+	if isCharging && avgSOC >= 97 {
+		c.epcStuckSince = time.Time{}
+		return
+	}
+	if !isCharging && avgSOC <= 5 {
+		c.epcStuckSince = time.Time{}
+		return
+	}
+
+	// Sum absolute power across all inverters
+	absPower := 0
+	for _, p := range bms.Power {
+		if p < 0 {
+			absPower += int(-p)
+		} else {
+			absPower += int(p)
+		}
+	}
+
+	// If total absolute power < 200W while we're commanding 2400W+, EPC is stuck
+	const stuckThresholdW = 200
+	if absPower >= stuckThresholdW {
+		// Inverters are responding — clear timer
+		c.epcStuckSince = time.Time{}
+		return
+	}
+
+	// BMS shows near-zero power despite commanding a rate
+	now := time.Now()
+	if c.epcStuckSince.IsZero() {
+		c.epcStuckSince = now
+		slog.Warn("epc_stuck_detected",
+			"commanded_w", commandedRate,
+			"bms_power", absPower,
+		)
+		return
+	}
+
+	const epcStuckTimeout = 3 * time.Minute
+	const cycleRetryInterval = 10 * time.Minute
+	stuckDuration := now.Sub(c.epcStuckSince)
+	if stuckDuration < epcStuckTimeout {
+		return
+	}
+
+	// EPC is stuck for 3+ minutes — try standby cycle
+	if c.rebooter == nil {
+		return
+	}
+	if !c.lastCycleAt.IsZero() && time.Since(c.lastCycleAt) < cycleRetryInterval {
+		return // Don't retry too often
+	}
+
+	slog.Warn("epc_stuck_cycling",
+		"stuck_for", stuckDuration,
+		"commanded_w", commandedRate,
+		"bms_power", absPower,
+	)
+	if c.alerter != nil {
+		c.alerter.SendFailureAlert(fmt.Sprintf(
+			"EPC stuck — writes OK but BMS power %dW (commanded %dW/inv). Cycling inverters standby/operating.",
+			absPower, commandedRate,
+		))
+	}
+
+	cycleCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	err := c.rebooter.CycleInverters(cycleCtx)
+	cancel()
+	c.lastCycleAt = time.Now()
+
+	if err != nil {
+		slog.Error("inverter_cycle_failed", "error", err)
+		if c.alerter != nil {
+			c.alerter.SendFailureAlert("Inverter cycle failed: " + err.Error())
+		}
+		return
+	}
+
+	slog.Info("inverter_cycle_success", "reapplying_state", state.String())
+
+	// Wait a moment for inverters to fully initialize after cycle
+	time.Sleep(5 * time.Second)
+
+	// Re-apply current state
+	if err := c.applyCurrentState(); err != nil {
+		slog.Error("failed to reapply state after cycle", "error", err)
+	}
+
+	// Reset detection timer — give it time to verify
+	c.epcStuckSince = time.Time{}
+
+	if c.alerter != nil {
+		c.alerter.SendRecoveryAlert("Inverters cycled, reapplied " + state.String())
 	}
 }
 
