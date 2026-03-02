@@ -50,6 +50,7 @@ type Controller struct {
 	lastRebootAt         time.Time // Last gateway reboot attempt
 	lastCycleAt          time.Time // Last inverter standby cycle attempt
 	epcStuckSince        time.Time // When we first detected EPC stuck (writes OK but BMS power 0)
+	epcCycleCount        int       // Consecutive standby cycles that failed to unstick EPC
 
 	// Day peak shave tracking
 	dayDischargeSince time.Time // When sustained high import started during day
@@ -383,8 +384,7 @@ func (c *Controller) sendKeepalive() {
 }
 
 // checkEPCStuck detects when writes succeed but inverters aren't responding.
-// If BMS total power is near zero for 3+ minutes while we're commanding
-// charge or discharge, trigger a standby cycle.
+// Escalation: standby cycle x2 → gateway reboot → give up (alert for manual intervention).
 func (c *Controller) checkEPCStuck() {
 	state := c.state.Current()
 
@@ -401,11 +401,13 @@ func (c *Controller) checkEPCStuck() {
 		commandedRate = c.currentDischargeW
 	default:
 		c.epcStuckSince = time.Time{}
+		c.epcCycleCount = 0
 		return
 	}
 
 	if commandedRate == 0 {
 		c.epcStuckSince = time.Time{}
+		c.epcCycleCount = 0
 		return
 	}
 
@@ -416,7 +418,6 @@ func (c *Controller) checkEPCStuck() {
 	c.mu.RUnlock()
 
 	if bms == nil || bmsAge > 2*time.Minute {
-		// No BMS data or stale — can't detect
 		return
 	}
 
@@ -426,10 +427,12 @@ func (c *Controller) checkEPCStuck() {
 	isCharging := state == StateDayCharge && !c.dayDischarging
 	if isCharging && avgSOC >= 97 {
 		c.epcStuckSince = time.Time{}
+		c.epcCycleCount = 0
 		return
 	}
 	if !isCharging && avgSOC <= 5 {
 		c.epcStuckSince = time.Time{}
+		c.epcCycleCount = 0
 		return
 	}
 
@@ -443,11 +446,14 @@ func (c *Controller) checkEPCStuck() {
 		}
 	}
 
-	// If total absolute power < 200W while we're commanding 2400W+, EPC is stuck
+	// If total absolute power >= 200W, inverters are responding
 	const stuckThresholdW = 200
 	if absPower >= stuckThresholdW {
-		// Inverters are responding — clear timer
+		if c.epcCycleCount > 0 {
+			slog.Info("epc_unstuck", "bms_power", absPower, "after_cycles", c.epcCycleCount)
+		}
 		c.epcStuckSince = time.Time{}
+		c.epcCycleCount = 0
 		return
 	}
 
@@ -463,32 +469,72 @@ func (c *Controller) checkEPCStuck() {
 	}
 
 	const epcStuckTimeout = 3 * time.Minute
-	const cycleRetryInterval = 10 * time.Minute
+	const actionRetryInterval = 10 * time.Minute
+	const maxCycleBeforeReboot = 2
+	const maxTotalAttempts = 4 // 2 cycles + 1 reboot + 1 post-reboot cycle
+
 	stuckDuration := now.Sub(c.epcStuckSince)
 	if stuckDuration < epcStuckTimeout {
 		return
 	}
 
-	// EPC is stuck for 3+ minutes — try standby cycle
 	if c.rebooter == nil {
 		return
 	}
-	if !c.lastCycleAt.IsZero() && time.Since(c.lastCycleAt) < cycleRetryInterval {
-		return // Don't retry too often
+	if !c.lastCycleAt.IsZero() && time.Since(c.lastCycleAt) < actionRetryInterval {
+		return
 	}
 
-	slog.Warn("epc_stuck_cycling",
-		"stuck_for", stuckDuration,
-		"commanded_w", commandedRate,
-		"bms_power", absPower,
-	)
-	if c.alerter != nil {
-		c.alerter.SendFailureAlert(fmt.Sprintf(
-			"EPC stuck — writes OK but BMS power %dW (commanded %dW/inv). Cycling inverters standby/operating.",
-			absPower, commandedRate,
-		))
+	// Give up after maxTotalAttempts — requires manual /stop + /start or /cycle
+	if c.epcCycleCount >= maxTotalAttempts {
+		return
 	}
 
+	c.epcCycleCount++
+
+	// Escalation: first 2 attempts = standby cycle, 3rd = gateway reboot, 4th = post-reboot cycle
+	if c.epcCycleCount <= maxCycleBeforeReboot {
+		// Standby cycle
+		slog.Warn("epc_stuck_cycling",
+			"attempt", c.epcCycleCount,
+			"stuck_for", stuckDuration,
+			"commanded_w", commandedRate,
+			"bms_power", absPower,
+		)
+		if c.alerter != nil {
+			c.alerter.SendFailureAlert(fmt.Sprintf(
+				"EPC stuck (attempt %d) — BMS %dW, commanded %dW/inv. Cycling standby/operating.",
+				c.epcCycleCount, absPower, commandedRate,
+			))
+		}
+		c.doEPCCycle(state)
+	} else if c.epcCycleCount == maxCycleBeforeReboot+1 {
+		// Escalate to gateway reboot
+		slog.Warn("epc_stuck_rebooting_gateway",
+			"attempt", c.epcCycleCount,
+			"stuck_for", stuckDuration,
+			"commanded_w", commandedRate,
+			"bms_power", absPower,
+		)
+		if c.alerter != nil {
+			c.alerter.SendFailureAlert(fmt.Sprintf(
+				"EPC stuck after %d cycles — rebooting gateway. BMS %dW, commanded %dW/inv.",
+				maxCycleBeforeReboot, absPower, commandedRate,
+			))
+		}
+		c.doEPCReboot(state)
+	} else {
+		// Post-reboot cycle
+		slog.Warn("epc_stuck_post_reboot_cycle",
+			"attempt", c.epcCycleCount,
+			"stuck_for", stuckDuration,
+		)
+		c.doEPCCycle(state)
+	}
+}
+
+// doEPCCycle performs a standby/operating cycle and reapplies state.
+func (c *Controller) doEPCCycle(state State) {
 	cycleCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	err := c.rebooter.CycleInverters(cycleCtx)
 	cancel()
@@ -496,27 +542,58 @@ func (c *Controller) checkEPCStuck() {
 
 	if err != nil {
 		slog.Error("inverter_cycle_failed", "error", err)
-		if c.alerter != nil {
-			c.alerter.SendFailureAlert("Inverter cycle failed: " + err.Error())
-		}
 		return
 	}
 
 	slog.Info("inverter_cycle_success", "reapplying_state", state.String())
-
-	// Wait a moment for inverters to fully initialize after cycle
 	time.Sleep(5 * time.Second)
 
-	// Re-apply current state
 	if err := c.applyCurrentState(); err != nil {
 		slog.Error("failed to reapply state after cycle", "error", err)
 	}
 
-	// Reset detection timer — give it time to verify
+	// Reset stuck timer so detection re-evaluates after the cycle
+	c.epcStuckSince = time.Time{}
+}
+
+// doEPCReboot reboots the gateway, waits for it to come back, then cycles inverters.
+func (c *Controller) doEPCReboot(state State) {
+	rebootCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	err := c.rebooter.Reboot(rebootCtx)
+	cancel()
+	c.lastCycleAt = time.Now()
+	c.lastRebootAt = time.Now()
+
+	if err != nil {
+		slog.Error("epc_gateway_reboot_failed", "error", err)
+		return
+	}
+
+	slog.Info("epc_gateway_reboot_success", "waiting", "90s")
+	time.Sleep(90 * time.Second)
+
+	// After gateway comes back, do a standby cycle to reset EPC
+	slog.Info("epc_post_reboot_cycling")
+	cycleCtx, cycleCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	err = c.rebooter.CycleInverters(cycleCtx)
+	cycleCancel()
+
+	if err != nil {
+		slog.Error("epc_post_reboot_cycle_failed", "error", err)
+		// Still try to reapply state
+	}
+
+	time.Sleep(5 * time.Second)
+
+	if err := c.applyCurrentState(); err != nil {
+		slog.Error("failed to reapply state after reboot", "error", err)
+	}
+
+	// Reset stuck timer so detection re-evaluates
 	c.epcStuckSince = time.Time{}
 
 	if c.alerter != nil {
-		c.alerter.SendRecoveryAlert("Inverters cycled, reapplied " + state.String())
+		c.alerter.SendRecoveryAlert("Gateway rebooted + cycled, reapplied " + state.String())
 	}
 }
 
