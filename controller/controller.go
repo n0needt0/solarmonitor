@@ -474,8 +474,24 @@ func (c *Controller) checkEPCStuck() {
 		return
 	}
 
-	// Don't retry more than once — if this doesn't fix it, manual intervention needed
-	if c.epcCycleCount > 0 {
+	const maxAttempts = 3
+	const retryInterval = 10 * time.Minute
+
+	if c.epcCycleCount >= maxAttempts {
+		// Alert once when we exhaust all attempts
+		if c.epcCycleCount == maxAttempts {
+			c.epcCycleCount++ // prevent repeated alerts
+			slog.Error("epc_stuck_gave_up", "attempts", maxAttempts)
+			if c.alerter != nil {
+				c.alerter.SendFailureAlert(fmt.Sprintf(
+					"EPC stuck — %d recovery attempts failed. Manual /stop + /start needed.",
+					maxAttempts,
+				))
+			}
+		}
+		return
+	}
+	if !c.lastCycleAt.IsZero() && time.Since(c.lastCycleAt) < retryInterval {
 		return
 	}
 
@@ -483,14 +499,16 @@ func (c *Controller) checkEPCStuck() {
 	c.lastCycleAt = now
 
 	slog.Warn("epc_stuck_recovering",
+		"attempt", c.epcCycleCount+1,
+		"max", maxAttempts,
 		"stuck_for", stuckDuration,
 		"commanded_w", commandedRate,
 		"bms_power", absPower,
 	)
 	if c.alerter != nil {
 		c.alerter.SendFailureAlert(fmt.Sprintf(
-			"EPC stuck — BMS %dW, commanded %dW/inv. Running stop → reboot → start recovery.",
-			absPower, commandedRate,
+			"EPC stuck (attempt %d/%d) — BMS %dW, commanded %dW/inv. Running stop → reboot → start.",
+			c.epcCycleCount+1, maxAttempts, absPower, commandedRate,
 		))
 	}
 
