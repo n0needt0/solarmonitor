@@ -208,53 +208,32 @@ func (b *Bot) handleUpdate(update Update) {
 
 	switch msg.Text {
 	case "/status":
-		slog.Info("telegram_cmd", "cmd", "status")
 		response = b.handler.HandleStatus()
-
 	case "/stop":
-		slog.Info("telegram_cmd", "cmd", "stop")
 		response = b.handler.HandleStop()
-
 	case "/start":
-		slog.Info("telegram_cmd", "cmd", "start")
 		response = b.handler.HandleStart()
-
 	case "/up":
-		slog.Info("telegram_cmd", "cmd", "up")
 		response = b.handler.HandleUp()
-
 	case "/down":
-		slog.Info("telegram_cmd", "cmd", "down")
 		response = b.handler.HandleDown()
-
 	case "/stats":
-		slog.Info("telegram_cmd", "cmd", "stats")
 		response = b.handler.HandleStats()
-
 	case "/charge":
-		slog.Info("telegram_cmd", "cmd", "charge")
 		response = b.handler.HandleCharge()
-
 	case "/discharge":
-		slog.Info("telegram_cmd", "cmd", "discharge")
 		response = b.handler.HandleDischarge()
-
 	case "/reboot":
-		slog.Info("telegram_cmd", "cmd", "reboot")
 		response = b.handler.HandleReboot()
-
 	case "/cycle":
-		slog.Info("telegram_cmd", "cmd", "cycle")
 		response = b.handler.HandleCycle()
-
 	case "/help":
-		slog.Info("telegram_cmd", "cmd", "help")
 		response = FormatHelp()
-
 	default:
-		// Unknown command - ignore
 		return
 	}
+
+	slog.Info("telegram_cmd", "cmd", msg.Text)
 
 	if response != "" {
 		if err := b.SendMessage(response); err != nil {
@@ -318,5 +297,3 @@ func (b *Bot) Alert(alertType, message string) error {
 	slog.Info("telegram_alert", "type", alertType)
 	return nil
 }
-
-

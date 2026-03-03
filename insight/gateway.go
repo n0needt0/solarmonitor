@@ -43,31 +43,41 @@ type varsResponse struct {
 	OTK string `json:"OTK"`
 }
 
+// login authenticates to the gateway API and returns the session token.
+func (g *GatewayRebooter) login(ctx context.Context, logPrefix string) (string, error) {
+	baseURL := fmt.Sprintf("https://%s", g.host)
+
+	slog.Info(logPrefix+"_login", "host", g.host)
+	authBody := fmt.Sprintf("username=%s&password=%s&session=true", g.username, g.password)
+	resp, err := g.postAPI(ctx, baseURL+"/auth", authBody, "", "")
+	if err != nil {
+		return "", fmt.Errorf("gateway login: %w", err)
+	}
+
+	var auth authResponse
+	if err := json.Unmarshal([]byte(resp), &auth); err != nil {
+		return "", fmt.Errorf("gateway login parse: %w (body: %s)", err, resp)
+	}
+	if auth.Session == "" {
+		return "", fmt.Errorf("gateway login: no session token (body: %s)", resp)
+	}
+	slog.Info(logPrefix + "_logged_in")
+	return auth.Session, nil
+}
+
 // Reboot authenticates to the gateway API and sends the reboot command.
 // Three HTTP calls: login → get OTK → set reboot. No browser needed.
 func (g *GatewayRebooter) Reboot(ctx context.Context) error {
 	baseURL := fmt.Sprintf("https://%s", g.host)
 
-	// Step 1: Login — POST /auth
-	slog.Info("gateway_reboot_login", "host", g.host)
-	authBody := fmt.Sprintf("username=%s&password=%s&session=true", g.username, g.password)
-	session, err := g.postAPI(ctx, baseURL+"/auth", authBody, "", "")
+	session, err := g.login(ctx, "gateway_reboot")
 	if err != nil {
-		return fmt.Errorf("gateway login: %w", err)
+		return err
 	}
-
-	var auth authResponse
-	if err := json.Unmarshal([]byte(session), &auth); err != nil {
-		return fmt.Errorf("gateway login parse: %w (body: %s)", err, session)
-	}
-	if auth.Session == "" {
-		return fmt.Errorf("gateway login: no session token (body: %s)", session)
-	}
-	slog.Info("gateway_reboot_logged_in")
 
 	// Step 2: Get OTK — POST /vars with any variable read
 	varsBody := "name=SERIALNUM"
-	varsResp, err := g.postAPI(ctx, baseURL+"/vars", varsBody, auth.Session, "")
+	varsResp, err := g.postAPI(ctx, baseURL+"/vars", varsBody, session, "")
 	if err != nil {
 		return fmt.Errorf("gateway get OTK: %w", err)
 	}
@@ -83,7 +93,7 @@ func (g *GatewayRebooter) Reboot(ctx context.Context) error {
 
 	// Step 3: Reboot — POST /set with reboot command
 	setBody := "/SCB/LSYS/REBOOT= 1"
-	setResp, err := g.postAPI(ctx, baseURL+"/set", setBody, auth.Session, vars.OTK)
+	setResp, err := g.postAPI(ctx, baseURL+"/set", setBody, session, vars.OTK)
 	if err != nil {
 		return fmt.Errorf("gateway reboot command: %w", err)
 	}
@@ -113,24 +123,13 @@ type devListEntry struct {
 func (g *GatewayRebooter) CycleInverters(ctx context.Context) error {
 	baseURL := fmt.Sprintf("https://%s", g.host)
 
-	// Step 1: Login
-	slog.Info("inverter_cycle_login", "host", g.host)
-	authBody := fmt.Sprintf("username=%s&password=%s&session=true", g.username, g.password)
-	session, err := g.postAPI(ctx, baseURL+"/auth", authBody, "", "")
+	session, err := g.login(ctx, "inverter_cycle")
 	if err != nil {
-		return fmt.Errorf("gateway login: %w", err)
-	}
-
-	var auth authResponse
-	if err := json.Unmarshal([]byte(session), &auth); err != nil {
-		return fmt.Errorf("gateway login parse: %w (body: %s)", err, session)
-	}
-	if auth.Session == "" {
-		return fmt.Errorf("gateway login: no session (body: %s)", session)
+		return err
 	}
 
 	// Step 2: Get DEVLIST to find XW inverter instances
-	devResp, err := g.postAPI(ctx, baseURL+"/vars", "name=DEVLIST", auth.Session, "")
+	devResp, err := g.postAPI(ctx, baseURL+"/vars", "name=DEVLIST", session, "")
 	if err != nil {
 		return fmt.Errorf("get DEVLIST: %w", err)
 	}
@@ -159,7 +158,7 @@ func (g *GatewayRebooter) CycleInverters(ctx context.Context) error {
 	// Step 3: Set all to standby (CFG_OPMODE = 2)
 	for _, inst := range xwInstances {
 		setBody := fmt.Sprintf("[%d]/XW/DEV/CFG_OPMODE= 2", inst)
-		resp, err := g.postAPI(ctx, baseURL+"/set", setBody, auth.Session, otk)
+		resp, err := g.postAPI(ctx, baseURL+"/set", setBody, session, otk)
 		if err != nil {
 			return fmt.Errorf("set standby instance %d: %w", inst, err)
 		}
@@ -182,7 +181,7 @@ func (g *GatewayRebooter) CycleInverters(ctx context.Context) error {
 	// Step 5: Set all back to operating (CFG_OPMODE = 3)
 	for _, inst := range xwInstances {
 		setBody := fmt.Sprintf("[%d]/XW/DEV/CFG_OPMODE= 3", inst)
-		resp, err := g.postAPI(ctx, baseURL+"/set", setBody, auth.Session, otk)
+		resp, err := g.postAPI(ctx, baseURL+"/set", setBody, session, otk)
 		if err != nil {
 			return fmt.Errorf("set operating instance %d: %w", inst, err)
 		}

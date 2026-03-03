@@ -101,36 +101,35 @@ func FormatRecovery(state string, gridL1, gridL2 float32, soc int) string {
 		now, gridL1, gridL2, soc, state)
 }
 
+// gridSummary returns (direction, absKW) for the combined grid reading.
+func gridSummary(gridL1, gridL2 float32) (string, float32) {
+	total := gridL1 + gridL2
+	if total < 0 {
+		return "exporting", -total / 1000
+	}
+	return "importing", total / 1000
+}
+
 // FormatStopped formats a manual stop alert
 func FormatStopped(gridL1, gridL2 float32, soc int) string {
 	now := time.Now().Format("15:04")
-	gridTotal := gridL1 + gridL2
-	action := "importing"
-	if gridTotal < 0 {
-		action = "exporting"
-		gridTotal = -gridTotal
-	}
+	action, kw := gridSummary(gridL1, gridL2)
 	return fmt.Sprintf(`→ STOPPED at %s (manual)
   Grid: %s %.1fkW
   SOC: %d%%
   Inverters: all idle`,
-		now, action, gridTotal/1000, soc)
+		now, action, kw, soc)
 }
 
 // FormatStarted formats a manual start alert
 func FormatStarted(state string, gridL1, gridL2 float32, soc int) string {
 	now := time.Now().Format("15:04")
-	gridTotal := gridL1 + gridL2
-	action := "importing"
-	if gridTotal < 0 {
-		action = "exporting"
-		gridTotal = -gridTotal
-	}
+	action, kw := gridSummary(gridL1, gridL2)
 	return fmt.Sprintf(`→ STARTED at %s (manual)
   Grid: %s %.1fkW
   SOC: %d%%
   Mode: %s`,
-		now, action, gridTotal/1000, soc, state)
+		now, action, kw, soc, state)
 }
 
 // FormatHelp returns the help text listing all commands

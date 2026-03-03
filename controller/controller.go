@@ -331,18 +331,16 @@ func (c *Controller) sendKeepalive() {
 				slog.Warn("keepalive charge failed", "error", keepaliveErr)
 			}
 		}
-		c.lastKeepaliveAt = time.Now()
 
 	case StateNightDischarge, StateNightReduced:
-		// Re-send discharge rates with SOC balancing
 		if c.currentDischargeW > 0 {
 			keepaliveErr = c.writeDischargeRates(c.currentDischargeW)
 			if keepaliveErr != nil {
 				slog.Warn("keepalive discharge failed", "error", keepaliveErr)
 			}
 		}
-		c.lastKeepaliveAt = time.Now()
 	}
+	c.lastKeepaliveAt = time.Now()
 
 	// Track consecutive Modbus exception 3 — indicates gateway lost Xanbus to inverters
 	const maxWriteFail = 5
@@ -383,6 +381,12 @@ func (c *Controller) sendKeepalive() {
 	}
 }
 
+// resetEPCStuck clears EPC stuck detection state
+func (c *Controller) resetEPCStuck() {
+	c.epcStuckSince = time.Time{}
+	c.epcCycleCount = 0
+}
+
 // checkEPCStuck detects when writes succeed but inverters aren't responding.
 // Recovery sequence mirrors what works manually: stop → reboot gateway → stop → start.
 func (c *Controller) checkEPCStuck() {
@@ -400,14 +404,12 @@ func (c *Controller) checkEPCStuck() {
 	case StateNightDischarge, StateNightReduced:
 		commandedRate = c.currentDischargeW
 	default:
-		c.epcStuckSince = time.Time{}
-		c.epcCycleCount = 0
+		c.resetEPCStuck()
 		return
 	}
 
 	if commandedRate == 0 {
-		c.epcStuckSince = time.Time{}
-		c.epcCycleCount = 0
+		c.resetEPCStuck()
 		return
 	}
 
@@ -425,13 +427,11 @@ func (c *Controller) checkEPCStuck() {
 	avgSOC := bms.TotalSOC()
 	isCharging := state == StateDayCharge && !c.dayDischarging
 	if isCharging && avgSOC >= 97 {
-		c.epcStuckSince = time.Time{}
-		c.epcCycleCount = 0
+		c.resetEPCStuck()
 		return
 	}
 	if !isCharging && avgSOC <= 5 {
-		c.epcStuckSince = time.Time{}
-		c.epcCycleCount = 0
+		c.resetEPCStuck()
 		return
 	}
 
@@ -450,8 +450,7 @@ func (c *Controller) checkEPCStuck() {
 		if c.epcCycleCount > 0 {
 			slog.Info("epc_unstuck", "bms_power", absPower, "after_attempts", c.epcCycleCount)
 		}
-		c.epcStuckSince = time.Time{}
-		c.epcCycleCount = 0
+		c.resetEPCStuck()
 		return
 	}
 
@@ -499,7 +498,7 @@ func (c *Controller) checkEPCStuck() {
 	c.lastCycleAt = now
 
 	slog.Warn("epc_stuck_recovering",
-		"attempt", c.epcCycleCount+1,
+		"attempt", c.epcCycleCount,
 		"max", maxAttempts,
 		"stuck_for", stuckDuration,
 		"commanded_w", commandedRate,
@@ -508,7 +507,7 @@ func (c *Controller) checkEPCStuck() {
 	if c.alerter != nil {
 		c.alerter.SendFailureAlert(fmt.Sprintf(
 			"EPC stuck (attempt %d/%d) — BMS %dW, commanded %dW/inv. Running stop → reboot → start.",
-			c.epcCycleCount+1, maxAttempts, absPower, commandedRate,
+			c.epcCycleCount, maxAttempts, absPower, commandedRate,
 		))
 	}
 
@@ -544,7 +543,7 @@ func (c *Controller) checkEPCStuck() {
 		slog.Error("epc_recovery_apply_failed", "error", err)
 	}
 
-	c.epcStuckSince = time.Time{}
+	c.resetEPCStuck()
 
 	if c.alerter != nil {
 		c.alerter.SendRecoveryAlert("EPC recovery complete (stop → reboot → start)")
