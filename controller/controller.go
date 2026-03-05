@@ -1410,6 +1410,12 @@ func (c *Controller) nightExportDetected(grid wattnode.GridPower) {
 		)
 		c.stats.StartSession(SessionCharge, soc)
 		c.state.Transition(StateDayCharge, "solar export idled all inverters — starting charge")
+
+		// Set manual override so checkTimeTransitions doesn't bounce us
+		// back to NIGHT_DISCHARGE before the charge window opens
+		c.manualOverride = true
+		c.manualOverrideInDay = false // override was set during discharge window
+
 		if err := c.applyCurrentState(); err != nil {
 			slog.Error("failed to apply day charge state", "error", err)
 		}
