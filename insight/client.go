@@ -297,6 +297,19 @@ func (c *Client) ReadHoldingRegisters(unitID byte, startRegister uint16, count u
 	}
 }
 
+// conditionBus sends a throwaway read on the read port to wake up the
+// gateway's Modbus TCP-to-XanBus bridge for a specific unit. Called before
+// writes when the bus has been idle, since the first device in the chain
+// (unit 10) tends to reject writes after long quiet periods.
+func (c *Client) conditionBus(unitID byte) {
+	c.readHandler.SlaveId = unitID
+	_, _ = c.readClient.ReadHoldingRegisters(RegEPCModeCommand, 1)
+}
+
+// busIdleThreshold is how long the write port must be idle before we send
+// a conditioning read to wake up the gateway bridge.
+const busIdleThreshold = 30 * time.Second
+
 // WriteRegister writes a single holding register to an inverter
 func (c *Client) WriteRegister(unitID byte, register uint16, value uint16) error {
 	ch := make(chan error, 1)
@@ -305,6 +318,11 @@ func (c *Client) WriteRegister(unitID byte, register uint16, value uint16) error
 		defer c.mu.Unlock()
 
 		c.recoverIfStuck()
+
+		// Wake up the gateway bridge if the bus has been quiet
+		if !c.lastWriteAt.IsZero() && time.Since(c.lastWriteAt) > busIdleThreshold {
+			c.conditionBus(unitID)
+		}
 
 		for attempt := 0; attempt < 2; attempt++ {
 			c.waitForGap()

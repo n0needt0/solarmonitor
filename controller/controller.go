@@ -1462,8 +1462,13 @@ func (c *Controller) runNightReducedLogic(grid wattnode.GridPower) {
 		}
 	}
 
-	// Resume logic: if importing > 2.5kW sustained for 5 min, undo one guard reduction
-	const resumeImportW = 2500
+	// Resume logic: if importing > 2× the increase from undoing one guard step,
+	// sustained for 5 min, undo one guard reduction.
+	// Each step adds preGuardDischargeW total watts; require 2× that as headroom.
+	resumeImportW := c.preGuardDischargeW * 2
+	if resumeImportW < 600 {
+		resumeImportW = 600 // floor: at least 600W import to resume
+	}
 	const resumeHoldDur = 5 * time.Minute
 
 	if c.dischargeGuardCount <= 0 {
