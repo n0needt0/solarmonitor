@@ -5,6 +5,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
+EnvironmentFile=-/etc/solarcontrol/env
 ExecStart=/usr/local/bin/solarcontrol -config /etc/solarcontrol/config.yaml
 Restart=always
 RestartSec=1

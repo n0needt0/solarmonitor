@@ -108,11 +108,31 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
+	// Override secrets from environment variables
+	cfg.applyEnvOverrides()
+
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("validate config: %w", err)
 	}
 
 	return &cfg, nil
+}
+
+// applyEnvOverrides replaces config values with environment variables when set.
+// This keeps secrets out of config.yaml.
+func (c *Config) applyEnvOverrides() {
+	if v := os.Getenv("TELEGRAM_BOT_TOKEN"); v != "" {
+		c.Telegram.BotToken = v
+	}
+	if v := os.Getenv("TELEGRAM_CHAT_ID"); v != "" {
+		c.Telegram.ChatID = v
+	}
+	if v := os.Getenv("GATEWAY_USER"); v != "" {
+		c.Insight.GatewayUser = v
+	}
+	if v := os.Getenv("GATEWAY_PASSWORD"); v != "" {
+		c.Insight.GatewayPassword = v
+	}
 }
 
 func (c *Config) Validate() error {

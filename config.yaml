@@ -50,7 +50,7 @@ logging:
   file: /var/log/solarcontrol.log
 
 telegram:
-  bot_token: "8084227300:AAHlBMq_BPYhw-o3FoAJlfgBBluaL7mpiJg"
-  chat_id: "5283618710"
+  bot_token: ""   # set via TELEGRAM_BOT_TOKEN env var
+  chat_id: ""     # set via TELEGRAM_CHAT_ID env var
   poll_timeout_sec: 30
   manual_step_w: 300
