@@ -19,7 +19,7 @@ New WattNode WND-WR-MB ──────────────── Raspberr
   │                                         ▼
   │                              ┌────────────────────┐
   │                              │   4x XW Pro 6848   │
-  │                              │   Unit IDs 10-13   │
+  │                              │   Unit IDs 11-14   │
   │                              ├────────────────────┤
   │                              │   4x SunVault      │
   │                              │   78 kWh (3x per)  │
@@ -33,7 +33,7 @@ Existing WattNode (S/N 9308266)
 
 | Component | Spec |
 |-----------|------|
-| Inverters | 4x XW Pro 6848 — unit IDs 10 (master), 11, 13, 12 (slaves) |
+| Inverters | 4x XW Pro 6848 — unit IDs 11 (master), 12, 13, 14 (slaves) |
 | Batteries | 4x SunVault, 3x 6.5kWh M0020 per vault = 78 kWh total (~58 kWh usable) |
 | Charge breaker | 80A = 16kW max |
 | Solar arrays | ~19.5kW peak combined |
@@ -111,14 +111,37 @@ IDLE ─────────────────────────
 
 - Fixed 600W/inv base (2.4kW total)
 - Zero-tolerance export guard: any leg exporting = immediate action
-- Idles inverters one at a time (slaves first: 12 → 13 → 11, master 10 last)
+- Idles inverters one at a time (slaves first: 14 → 13 → 12, master 11 last)
 - Rebalances remaining inverters at reduced rate with SOC balancing
 - Dynamic resume: if grid import > 2x the step increase sustained for 5 minutes, restores one inverter
 - If all 4 idled and solar is exporting, transitions to early DAY_CHARGE (with manual override to prevent oscillation)
 
+## Inverter Unit IDs
+
+Unit IDs are assigned in the Insight Gateway web UI (https://192.168.86.86), not on the inverters themselves. The gateway discovers inverters on XanBus and assigns Modbus addresses to each.
+
+| Inv | Unit ID | Role | BMS Slot | Notes |
+|-----|---------|------|----------|-------|
+| 1 | 11 | Master | 0 | Higher SOC floor (25% vs 15%) |
+| 2 | 12 | Slave | 1 | |
+| 3 | 13 | Slave | 2 | |
+| 4 | 14 | Slave | 3 | |
+
+### How to Set Unit IDs
+
+1. Open Insight web UI at https://192.168.86.86 (Admin / Admin.1234)
+2. Navigate to device configuration
+3. Assign sequential Modbus addresses (11, 12, 13, 14) to each inverter
+4. Reboot gateway for changes to take effect
+5. Update `config.yaml` with new `master_unit_id`, `slave_unit_ids`, and `idle_order`
+
+After a gateway firmware update, unit IDs may get shuffled. Verify mapping by writing charge/discharge to one unit at a time and confirming which physical inverter responds via BMS power readings. Use the `cmd/diag` tool for this.
+
 ## Modbus Communication
 
-### Write Port 502 (XW Pro EPC Commands)
+### Port 502 (Read + Write — Primary)
+
+All EPC reads and writes go through port 502. This is the only port that exposes EPC registers.
 
 | Register | Description |
 |----------|-------------|
@@ -127,14 +150,29 @@ IDLE ─────────────────────────
 | 40152 | EPC Max Discharge Power (watts) |
 | 40149 | Recharge SOC (% x 10) |
 
-### Read Port 503 (BMS + Status)
+EPC mode value 3 may appear after gateway reboot — indicates inverters are in a transitional self-managing state before EPC takes control. Writing mode 1 or 2 overrides it.
+
+### Port 503 (Read-Only — BMS Only)
+
+Port 503 has a limited register set. As of gateway firmware v1.18, EPC registers (40210, 40213, 40152) return exception 2 (illegal data address) on port 503. Only BMS bulk read works.
 
 | Register | Description |
 |----------|-------------|
 | 960-1001 | BMS bulk read (unit ID 1): SOC + battery power for all 4 inverters |
 
+BMS data offsets (indices into uint16 array):
+
+| Offset | Description |
+|--------|-------------|
+| 7, 9 | Inv 1: Power (W, signed), SOC (%) |
+| 17, 19 | Inv 2: Power, SOC |
+| 27, 29 | Inv 3: Power, SOC |
+| 37, 39 | Inv 4: Power, SOC |
+
+### Bus Rules
+
 - 2-second minimum gap between writes (Schneider requirement)
-- Keepalive every 60 seconds (resend last command to prevent inverter timeout)
+- Keepalive every 60 seconds — power-only writes (no mode register) to halve bus time
 - Bus conditioning read before writes when idle > 30 seconds (wakes gateway bridge)
 - Dual TCP connections: separate read/write to prevent queue blocking
 
@@ -205,6 +243,8 @@ solarcontrol/
 ├── telegram/
 │   ├── bot.go               # Long-poll loop, message dispatch
 │   └── alerts.go            # Alert/status formatting
+├── cmd/
+│   └── diag/main.go         # Standalone Modbus register diagnostic tool
 └── deploy/
     ├── deploy.sh            # SSH deployment script
     ├── solarcontrol.service # Systemd unit
