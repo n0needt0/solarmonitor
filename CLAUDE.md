@@ -650,7 +650,9 @@ ssh nodered "sudo systemctl enable solarcontrol && sudo systemctl start solarcon
 
 ## Modbus Registers
 
-### WattNode (RTU, USB)
+### WattNode (RTU, USB — /dev/ttyUSB0)
+
+Dedicated WattNode WND-WR-MB connected to Pi via USB RS-485. Local reads only, does not touch Insight bus.
 
 | Register | Description | Type |
 |----------|-------------|------|
@@ -660,32 +662,83 @@ ssh nodered "sudo systemctl enable solarcontrol && sudo systemctl start solarcon
 | 1017 | Phase A Voltage | Float32 |
 | 1019 | Phase B Voltage | Float32 |
 
-### XW Pro — Port 502 (Write)
+### Insight Gateway — Port 502 (Read/Write)
 
-| Register | Description |
-|----------|-------------|
-| 40210 | EPC Charge Max Power (watts) |
-| 40213 | EPC Mode Command: 0=idle, 1=charge |
-| 40152 | EPC Max Discharge Power (watts) |
-| 40149 | Recharge SOC (% × 10, e.g., 990 = 99%) |
+Port 502 is the primary Modbus TCP port. Both reads and writes work on this port. Addresses are passed raw to goburrow/modbus (no 40001 offset needed — the gateway handles addressing internally).
 
-### XW Pro — Port 503 (Read)
+**EPC registers — per inverter (unit IDs 10, 11, 13, 12):**
 
-| Register | Description |
-|----------|-------------|
-| 40210 | Current EPC Charge Limit (watts) |
-| 40213 | Current EPC Mode (0=idle, 1=charge) |
+| Register | Description | Verified |
+|----------|-------------|----------|
+| 40210 | EPC Charge Max Power (watts) | read+write on 502 |
+| 40213 | EPC Mode Command: 0=idle, 1=charge, 2=discharge | read+write on 502 |
+| 40152 | EPC Max Discharge Power (watts) | read+write on 502 |
+| 40149 | Recharge SOC (% × 10, e.g., 990 = 99%) | write on 502 |
+
+**EPC Mode values observed:**
+
+| Value | Meaning |
+|-------|---------|
+| 0 | Idle |
+| 1 | Charge |
+| 2 | Discharge |
+| 3 | Unknown — seen after gateway reboot before Xanbus stabilizes |
+
+### Insight Gateway — Port 503 (Read-Only, Limited)
+
+Port 503 is a read-only port with a **limited register set**. EPC registers (40210, 40213, 40152, 40149) return **exception 2 (illegal data address)** on port 503 for all inverter unit IDs. Only BMS bulk read (unit ID 1) works reliably on this port.
+
+**DO NOT use port 503 to read EPC status. Use port 502 instead.**
 
 ### BMS Bulk Read — Port 503, Unit ID 1 (Registers 960-1001)
 
-| Offset | Description |
-|--------|-------------|
-| 7, 9 | Inv 1: SOC (%), Battery Power (W, signed) |
-| 17, 19 | Inv 2: SOC (%), Battery Power (W) |
-| 27, 29 | Inv 3: SOC (%), Battery Power (W) |
-| 37, 39 | Inv 4: SOC (%), Battery Power (W) |
+Returns uint16 array. Offsets are indices into the returned data array.
 
-Note: Battery power values >32767 are negative (subtract 65536).
+| Offset | Register | Description |
+|--------|----------|-------------|
+| 7 | 967 | Inv 1: Battery Power (W, signed int16) |
+| 9 | 969 | Inv 1: SOC (%) |
+| 17 | 977 | Inv 2: Battery Power (W, signed int16) |
+| 19 | 979 | Inv 2: SOC (%) |
+| 27 | 987 | Inv 3: Battery Power (W, signed int16) |
+| 29 | 989 | Inv 3: SOC (%) |
+| 37 | 997 | Inv 4: Battery Power (W, signed int16) |
+| 39 | 999 | Inv 4: SOC (%) |
+
+Power: positive = charging, negative = discharging. Raw uint16, convert with int16() cast.
+
+**BMS data is stale/invalid during gateway reboot** — SOC may read 3700+ or 0% until Xanbus re-establishes with all inverters. Always validate SOC range (0-100) before using.
+
+### Inverter Unit IDs and Mapping
+
+| Inv | Unit ID | Role | BMS Slot |
+|-----|---------|------|----------|
+| 1 | 11 | Master | 0 |
+| 2 | 12 | Slave | 1 |
+| 3 | 13 | Slave | 2 |
+| 4 | 14 | Slave | 3 |
+
+Idle order (discharge guard — slaves first, master last): [14, 13, 12, 11]
+
+### Gateway Reboot Behavior
+
+After gateway reboot, Xanbus takes time to re-enumerate inverters:
+- BMS bulk read (unit 1) responds first but with invalid data
+- EPC registers on port 502 come online per-inverter as each one connects
+- Some inverters may show mode=3 (transitional state) before settling
+- Individual inverters may be completely unresponsive for several minutes
+- Port 503 EPC reads never work (exception 2) regardless of gateway state
+
+### Bus Contention
+
+Insight bus capacity: 43,200 ops/day. Each Modbus TCP operation requires 2-second gap (min_gap_ms: 2000).
+
+**Keepalive budget (every 60s):**
+- Full write (mode + power): 4 inverters × 2 registers = 8 writes × 2s = 16s bus time
+- Power-only keepalive: 4 inverters × 1 register = 4 writes × 2s = 8s bus time
+- Power-only is preferred — halves bus time, leaves room for BMS/SOC reads
+
+**BMS read staleness:** If BMS read age exceeds 2 minutes, EPC stuck detection is skipped. Bus contention from full keepalives (16s/60s = 27%) can starve BMS reads, breaking stuck detection.
 
 ---
 

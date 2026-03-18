@@ -66,6 +66,35 @@ func (c *Client) SetDischargeMode(unitID byte, powerW uint16) error {
 }
 
 
+// SetDischargePower updates only the discharge power limit (no mode write).
+// Used for keepalives where mode is already set.
+func (c *Client) SetDischargePower(unitID byte, powerW uint16) error {
+	return c.WriteRegister(unitID, RegEPCMaxDischarge, powerW)
+}
+
+// SetChargePower updates only the charge power limit (no mode write).
+// Used for keepalives where mode is already set.
+func (c *Client) SetChargePower(unitID byte, powerW uint16) error {
+	return c.WriteRegister(unitID, RegEPCChargeMax, powerW)
+}
+
+// ReadEPCStatus reads current EPC mode and power limits from port 503 (read port).
+func (c *Client) ReadEPCStatus(unitID byte) (mode uint16, chargeW uint16, dischargeW uint16, err error) {
+	mode, err = c.ReadRegister(unitID, RegEPCModeCommand)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("read EPC mode: %w", err)
+	}
+	chargeW, err = c.ReadRegister(unitID, RegEPCChargeMax)
+	if err != nil {
+		return mode, 0, 0, fmt.Errorf("read charge max: %w", err)
+	}
+	dischargeW, err = c.ReadRegister(unitID, RegEPCMaxDischarge)
+	if err != nil {
+		return mode, chargeW, 0, fmt.Errorf("read discharge max: %w", err)
+	}
+	return mode, chargeW, dischargeW, nil
+}
+
 // IdleAllInverters sets all inverters to idle mode
 func (c *Client) IdleAllInverters(unitIDs []byte) error {
 	for _, id := range unitIDs {

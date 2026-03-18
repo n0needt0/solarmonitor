@@ -15,9 +15,9 @@ insight:
   keepalive_sec: 60
 
 inverters:
-  master_unit_id: 10
-  slave_unit_ids: [11, 13, 12]
-  idle_order: [12, 13, 11, 10]
+  master_unit_id: 11
+  slave_unit_ids: [12, 13, 14]
+  idle_order: [14, 13, 12, 11]
 
 charge:
   start_hour: 9

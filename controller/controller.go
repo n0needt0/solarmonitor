@@ -320,13 +320,13 @@ func (c *Controller) sendKeepalive() {
 	case StateDayCharge:
 		if c.dayDischarging {
 			if c.currentDischargeW > 0 {
-				keepaliveErr = c.writeDischargeRates(c.currentDischargeW)
+				keepaliveErr = c.writeDischargeKeepalive(c.currentDischargeW)
 				if keepaliveErr != nil {
 					slog.Warn("keepalive day discharge failed", "error", keepaliveErr)
 				}
 			}
 		} else if c.currentChargeW > 0 {
-			keepaliveErr = c.writeChargeRates(c.currentChargeW)
+			keepaliveErr = c.writeChargeKeepalive(c.currentChargeW)
 			if keepaliveErr != nil {
 				slog.Warn("keepalive charge failed", "error", keepaliveErr)
 			}
@@ -334,7 +334,7 @@ func (c *Controller) sendKeepalive() {
 
 	case StateNightDischarge, StateNightReduced:
 		if c.currentDischargeW > 0 {
-			keepaliveErr = c.writeDischargeRates(c.currentDischargeW)
+			keepaliveErr = c.writeDischargeKeepalive(c.currentDischargeW)
 			if keepaliveErr != nil {
 				slog.Warn("keepalive discharge failed", "error", keepaliveErr)
 			}
@@ -1272,6 +1272,44 @@ func (c *Controller) writeDischargeRates(perInvW int) error {
 		} else {
 			if err := c.insight.SetIdleMode(id); err != nil {
 				slog.Warn("idle write failed", "unit", id, "error", err)
+				if firstErr == nil {
+					firstErr = err
+				}
+			}
+		}
+	}
+	return firstErr
+}
+
+// writeDischargeKeepalive sends power-only writes (no mode register) for keepalive.
+// Halves bus time: 4 writes instead of 8 per keepalive cycle.
+func (c *Controller) writeDischargeKeepalive(perInvW int) error {
+	rates := c.balancedDischargeRates(perInvW)
+	unitIDs := c.cfg.AllUnitIDs()
+	var firstErr error
+	for i, id := range unitIDs {
+		if rates[i] > 0 {
+			if err := c.insight.SetDischargePower(id, uint16(rates[i])); err != nil {
+				slog.Warn("keepalive discharge write failed", "unit", id, "rate", rates[i], "error", err)
+				if firstErr == nil {
+					firstErr = err
+				}
+			}
+		}
+	}
+	return firstErr
+}
+
+// writeChargeKeepalive sends power-only writes (no mode register) for keepalive.
+// Halves bus time: 4 writes instead of 8 per keepalive cycle.
+func (c *Controller) writeChargeKeepalive(perInvW int) error {
+	rates := c.balancedChargeRates(perInvW)
+	unitIDs := c.cfg.AllUnitIDs()
+	var firstErr error
+	for i, id := range unitIDs {
+		if rates[i] > 0 {
+			if err := c.insight.SetChargePower(id, uint16(rates[i])); err != nil {
+				slog.Warn("keepalive charge write failed", "unit", id, "rate", rates[i], "error", err)
 				if firstErr == nil {
 					firstErr = err
 				}
