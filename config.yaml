@@ -21,7 +21,7 @@ inverters:
 
 charge:
   start_hour: 9
-  end_hour: 15
+  end_hour: 16
   start_per_inverter_w: 600
   max_per_inverter_w: 4000
   max_total_w: 16000

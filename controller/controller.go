@@ -836,24 +836,50 @@ func (c *Controller) runDayChargeLogic(grid wattnode.GridPower) {
 			return
 		}
 
-		// Match import: discharge to zero out grid, hold between adjustments
-		if time.Since(c.lastRampAt) >= time.Duration(c.cfg.RampUpHoldSec)*time.Second {
-			newPerInvW := min(gridW/4, maxDayDischargePerInvW)
-			if newPerInvW <= 0 {
-				// No longer importing — stop peak shave
-				c.stopDayDischarge()
-				return
-			}
-			if newPerInvW != c.currentDischargeW {
-				c.currentDischargeW = newPerInvW
-				if err := c.writeDischargeRates(newPerInvW); err != nil {
-					slog.Error("day discharge adjust failed", "error", err)
+		// Ramp discharge to keep import in 500-1000W band, same as night logic.
+		const dayImportFloor = 500
+		const dayImportCeil = 1000
+		const dayMinStep = 50
+		const dayMaxStep = 300
+
+		if time.Since(c.lastRampAt) >= 60*time.Second {
+			if gridW > dayImportCeil && c.currentDischargeW < maxDayDischargePerInvW {
+				step := clamp((gridW-dayImportCeil)/4, dayMinStep, dayMaxStep)
+				newW := min(c.currentDischargeW+step, maxDayDischargePerInvW)
+				slog.Info("day_discharge_ramp_up",
+					"import_w", gridW,
+					"from_per_inv_w", c.currentDischargeW,
+					"to_per_inv_w", newW,
+					"step", step,
+				)
+				c.currentDischargeW = newW
+				if err := c.writeDischargeRates(newW); err != nil {
+					slog.Error("day discharge ramp failed", "error", err)
 				}
 				c.lastRampAt = time.Now()
-				slog.Info("day_discharge_adjust",
+			} else if gridW < dayImportFloor {
+				if gridW <= 0 {
+					// Exporting — stop peak shave
+					c.stopDayDischarge()
+					return
+				}
+				step := clamp((dayImportFloor-gridW)/4, dayMinStep, dayMaxStep)
+				newW := max(c.currentDischargeW-step, 0)
+				if newW == 0 {
+					c.stopDayDischarge()
+					return
+				}
+				slog.Info("day_discharge_ramp_down",
 					"import_w", gridW,
-					"per_inv_w", newPerInvW,
+					"from_per_inv_w", c.currentDischargeW,
+					"to_per_inv_w", newW,
+					"step", step,
 				)
+				c.currentDischargeW = newW
+				if err := c.writeDischargeRates(newW); err != nil {
+					slog.Error("day discharge ramp failed", "error", err)
+				}
+				c.lastRampAt = time.Now()
 			}
 		}
 		return // skip normal charge logic while peak shaving
