@@ -961,7 +961,7 @@ func (c *Controller) runDayChargeLogic(grid wattnode.GridPower) {
 
 // startDayDischarge begins peak shave discharge during day
 func (c *Controller) startDayDischarge(gridW int, soc int) {
-	perInvW := clamp(gridW/4, 100, c.cfg.MaxDischargePerInvW)
+	perInvW := 300 // start low, ramp adjusts every 60s
 
 	c.dayDischarging = true
 	c.currentDischargeW = perInvW
@@ -1263,15 +1263,23 @@ func (c *Controller) writeChargeKeepalive(perInvW int) error {
 }
 
 // effectiveExportThreshold returns the net export threshold based on time of day.
-// During solar hours (8am-5pm), tolerate 100W from residual production.
-// Outside solar hours, use the configured threshold (50W noise tolerance).
 // PG&E meters net total across both legs — per-leg monitoring is unnecessary.
 func (c *Controller) effectiveExportThreshold() int {
 	hour := time.Now().Hour()
-	if hour >= 8 && hour < 17 {
-		return 100
+	if hour >= 7 && hour < 17 {
+		// Solar hours: tolerate 500W export — solar is producing,
+		// small net export is normal and not worth reducing discharge for.
+		return 500
 	}
 	return c.cfg.LegExportThresholdW
+}
+
+// isSunriseTransition returns true if we're in the hour before charge window
+// and solar is starting to produce. Used to skip guard reductions and transition
+// directly to DAY_CHARGE.
+func (c *Controller) isSunriseTransition() bool {
+	hour := time.Now().Hour()
+	return hour >= c.scheduler.chargeStartHour-1 && hour < c.scheduler.chargeStartHour
 }
 
 
@@ -1279,6 +1287,29 @@ func (c *Controller) effectiveExportThreshold() int {
 func (c *Controller) runNightDischargeLogic(grid wattnode.GridPower) {
 	// Skip night guard during manual override in charge window — solar export is expected
 	if !c.manualOverride || !c.scheduler.IsChargeWindow() {
+		// During sunrise transition (hour before charge window), any net export
+		// means solar is producing — skip guard, go straight to DAY_CHARGE.
+		if c.isSunriseTransition() && grid.Total < 0 {
+			slog.Info("sunrise_transition",
+				"l1_w", grid.L1,
+				"l2_w", grid.L2,
+				"total_w", grid.Total,
+			)
+			c.currentDischargeW = 0
+			if err := c.insight.IdleAllInverters(c.cfg.AllUnitIDs()); err != nil {
+				slog.Error("failed to idle on sunrise", "error", err)
+			}
+			soc := c.currentSOC()
+			c.stats.StartSession(SessionCharge, soc)
+			c.state.Transition(StateDayCharge, "sunrise — solar export detected")
+			c.manualOverride = true
+			c.manualOverrideInDay = false
+			if err := c.applyCurrentState(); err != nil {
+				slog.Error("failed to apply day charge", "error", err)
+			}
+			return
+		}
+
 		// Night guard: check net total power against threshold.
 		// PG&E meters net total across both legs, not per-leg.
 		threshold := c.effectiveExportThreshold()
@@ -1429,7 +1460,7 @@ func (c *Controller) nightExportDetected(grid wattnode.GridPower) {
 	c.stats.RecordNightGuardEvent(0, grid.L1, grid.L2, activeEquiv)
 
 	if c.state.Current() != StateNightReduced {
-		c.state.Transition(StateNightReduced, fmt.Sprintf("leg export detected, reduced to %dW/inv", c.currentDischargeW))
+		c.state.Transition(StateNightReduced, fmt.Sprintf("net export detected, reduced to %dW/inv", c.currentDischargeW))
 	}
 }
 
@@ -1437,6 +1468,27 @@ func (c *Controller) nightExportDetected(grid wattnode.GridPower) {
 func (c *Controller) runNightReducedLogic(grid wattnode.GridPower) {
 	// Skip night guard during manual override in charge window — solar export is expected
 	if !c.manualOverride || !c.scheduler.IsChargeWindow() {
+		// During sunrise, any export = transition to DAY_CHARGE immediately
+		if c.isSunriseTransition() && grid.Total < 0 {
+			slog.Info("sunrise_transition_from_reduced",
+				"total_w", grid.Total,
+				"guard_count", c.dischargeGuardCount,
+			)
+			c.currentDischargeW = 0
+			if err := c.insight.IdleAllInverters(c.cfg.AllUnitIDs()); err != nil {
+				slog.Error("failed to idle on sunrise", "error", err)
+			}
+			soc := c.currentSOC()
+			c.stats.StartSession(SessionCharge, soc)
+			c.state.Transition(StateDayCharge, "sunrise — solar export detected")
+			c.manualOverride = true
+			c.manualOverrideInDay = false
+			if err := c.applyCurrentState(); err != nil {
+				slog.Error("failed to apply day charge", "error", err)
+			}
+			return
+		}
+
 		// Still monitoring for export — if export returns, reduce further
 		// PG&E meters net total across both legs, not per-leg.
 		threshold := c.effectiveExportThreshold()
