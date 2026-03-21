@@ -63,12 +63,8 @@ type Controller struct {
 
 	// Night discharge tracking
 	currentDischargeW   int       // Current discharge rate per inverter
-	preGuardDischargeW  int       // Rate before first guard reduction
-	dischargeGuardCount int       // Number of guard reduction events (0-4)
 	dischargeRampSince  time.Time // When we first saw high import for discharge ramp
 	lastDischargeAdjust time.Time // Last time we adjusted discharge rate
-	highLoadSince       time.Time // When we first saw high import in NIGHT_REDUCED
-	resumeBelowCount    int       // Consecutive readings below resume threshold
 
 	// Session statistics
 	stats *StatsTracker
@@ -782,7 +778,7 @@ func (c *Controller) applyCurrentState() error {
 		// Don't start charging immediately - wait for export > threshold
 		c.currentChargeW = 0
 		c.waitingForExport = true
-		c.dischargeGuardCount = 0
+
 		c.dayDischarging = false
 		c.dayDischargeSince = time.Time{}
 		slog.Info("waiting_for_export", "threshold_w", c.cfg.ExportStartW)
@@ -790,7 +786,7 @@ func (c *Controller) applyCurrentState() error {
 
 	case StateNightDischarge:
 		c.currentDischargeW = 300 // start low, ramp up based on grid import
-		c.dischargeGuardCount = 0
+
 		c.dischargeRampSince = time.Time{}
 		c.lastDischargeAdjust = time.Time{}
 		return c.writeDischargeRates(c.currentDischargeW)
@@ -1342,13 +1338,31 @@ func (c *Controller) runNightDischargeLogic(grid wattnode.GridPower) {
 		}
 
 		// Sunset grace: skip guard for 30 min after discharge window starts
-		// Solar still tapering — let small export pass without reducing inverters
+		// Solar still tapering — let small export pass
 		if !c.isSunsetGracePeriod() {
-			// Night guard: check net total power against threshold.
+			// Export detected — immediate ramp down (no state change, no idling)
 			threshold := c.effectiveExportThreshold()
 			if grid.Total < float32(-threshold) {
-				c.nightExportDetected(grid)
-				c.dischargeRampSince = time.Time{}
+				exportW := int(-grid.Total)
+				step := clamp(exportW/4, 50, 300)
+				newW := max(c.currentDischargeW-step, 0)
+				slog.Warn("night_export_ramp_down",
+					"total_w", grid.Total,
+					"from_per_inv_w", c.currentDischargeW,
+					"to_per_inv_w", newW,
+					"step", step,
+				)
+				c.currentDischargeW = newW
+				if newW == 0 {
+					if err := c.insight.IdleAllInverters(c.cfg.AllUnitIDs()); err != nil {
+						slog.Error("idle all failed", "error", err)
+					}
+				} else {
+					if err := c.writeDischargeRates(newW); err != nil {
+						slog.Error("export ramp down failed", "error", err)
+					}
+				}
+				c.lastDischargeAdjust = time.Now()
 				return
 			}
 		}
@@ -1419,181 +1433,12 @@ func (c *Controller) runNightDischargeLogic(grid wattnode.GridPower) {
 	}
 }
 
-// nightExportDetected handles export detection at night
-// Fast response: idle one inverter immediately, then rebalance all 4 at reduced rate
-func (c *Controller) nightExportDetected(grid wattnode.GridPower) {
-	slog.Warn("night_export_detected",
-		"l1_w", grid.L1,
-		"l2_w", grid.L2,
-		"total_w", grid.Total,
-	)
 
-	if c.dischargeGuardCount >= 4 {
-		return // already fully reduced
-	}
-
-	// Snapshot rate before first reduction
-	if c.dischargeGuardCount == 0 {
-		c.preGuardDischargeW = c.currentDischargeW
-	}
-
-	c.dischargeGuardCount++
-	activeEquiv := 4 - c.dischargeGuardCount
-
-	if activeEquiv <= 0 {
-		// Fully reduced — idle all
-		c.currentDischargeW = 0
-		for _, id := range c.cfg.AllUnitIDs() {
-			if err := c.insight.SetIdleMode(id); err != nil {
-				slog.Error("failed to idle inverter", "unit", id, "error", err)
-			}
-		}
-
-		c.stats.RecordNightGuardEvent(0, grid.L1, grid.L2, activeEquiv)
-
-		// Solar is clearly producing — transition to DAY_CHARGE immediately
-		soc := c.currentSOC()
-
-		slog.Info("night_guard_early_charge",
-			"guard_count", c.dischargeGuardCount,
-			"l1_w", grid.L1,
-			"l2_w", grid.L2,
-		)
-		c.stats.StartSession(SessionCharge, soc)
-		c.state.Transition(StateDayCharge, "solar export idled all inverters — starting charge")
-
-		// Set manual override so checkTimeTransitions doesn't bounce us
-		// back to NIGHT_DISCHARGE before the charge window opens
-		c.manualOverride = true
-		c.manualOverrideInDay = false // override was set during discharge window
-
-		if err := c.applyCurrentState(); err != nil {
-			slog.Error("failed to apply day charge state", "error", err)
-		}
-		return
-	}
-
-	// Step 1: idle one inverter immediately for fast export reduction
-	idleTarget := c.cfg.IdleOrder[c.dischargeGuardCount-1]
-	if err := c.insight.SetIdleMode(idleTarget); err != nil {
-		slog.Error("failed to idle inverter", "unit", idleTarget, "error", err)
-	}
-
-	// Step 2: rebalance — spread reduced total across all 4 with SOC balancing
-	c.currentDischargeW = c.preGuardDischargeW * activeEquiv / 4
-	slog.Info("night_guard_rebalance",
-		"guard_count", c.dischargeGuardCount,
-		"idled_fast", idleTarget,
-		"per_inv_w", c.currentDischargeW,
-		"total_w", c.currentDischargeW*4,
-	)
-	if err := c.writeDischargeRates(c.currentDischargeW); err != nil {
-		slog.Error("failed to rebalance discharge", "error", err)
-	}
-
-	c.stats.RecordNightGuardEvent(0, grid.L1, grid.L2, activeEquiv)
-
-	if c.state.Current() != StateNightReduced {
-		c.state.Transition(StateNightReduced, fmt.Sprintf("net export detected, reduced to %dW/inv", c.currentDischargeW))
-	}
-}
-
-// runNightReducedLogic monitors for continued export and reduces further if needed
-func (c *Controller) runNightReducedLogic(grid wattnode.GridPower) {
-	// Skip night guard during manual override in charge window — solar export is expected
-	guardActive := !c.manualOverride || !c.scheduler.IsChargeWindow()
-
-	if guardActive {
-		// Sunrise: any export → transition to DAY_CHARGE immediately
-		if c.isSunriseTransition() && grid.Total < 0 {
-			slog.Info("sunrise_transition_from_reduced",
-				"total_w", grid.Total,
-				"guard_count", c.dischargeGuardCount,
-			)
-			c.currentDischargeW = 0
-			if err := c.insight.IdleAllInverters(c.cfg.AllUnitIDs()); err != nil {
-				slog.Error("failed to idle on sunrise", "error", err)
-			}
-			soc := c.currentSOC()
-			c.stats.StartSession(SessionCharge, soc)
-			c.state.Transition(StateDayCharge, "sunrise — solar export detected")
-			c.manualOverride = true
-			c.manualOverrideInDay = false
-			if err := c.applyCurrentState(); err != nil {
-				slog.Error("failed to apply day charge", "error", err)
-			}
-			return
-		}
-
-		// Sunset grace: skip guard for 30 min after discharge window starts
-		if !c.isSunsetGracePeriod() {
-			threshold := c.effectiveExportThreshold()
-			if grid.Total < float32(-threshold) {
-				c.nightExportDetected(grid)
-				c.highLoadSince = time.Time{}
-				c.resumeBelowCount = 0
-				return
-			}
-		}
-	}
-
-	// Resume logic: if importing > 2× the increase from undoing one guard step,
-	// sustained for 5 min, undo one guard reduction.
-	// Each step adds preGuardDischargeW total watts; require 2× that as headroom.
-	resumeImportW := c.preGuardDischargeW * 2
-	if resumeImportW < 600 {
-		resumeImportW = 600 // floor: at least 600W import to resume
-	}
-	const resumeHoldDur = 5 * time.Minute
-
-	if c.dischargeGuardCount <= 0 {
-		// Fully resumed — transition back to NIGHT_DISCHARGE
-		c.state.Transition(StateNightDischarge, "discharge fully restored")
-		c.highLoadSince = time.Time{}
-		c.resumeBelowCount = 0
-		return
-	}
-
-	if grid.Total > float32(resumeImportW) {
-		c.resumeBelowCount = 0
-		if c.highLoadSince.IsZero() {
-			c.highLoadSince = time.Now()
-			slog.Info("night_resume_timer_started",
-				"import_w", grid.Total,
-				"guard_count", c.dischargeGuardCount,
-			)
-		} else if time.Since(c.highLoadSince) >= resumeHoldDur {
-			// Undo one guard reduction — increase rate on all 4
-			c.dischargeGuardCount--
-			if c.dischargeGuardCount <= 0 {
-				c.currentDischargeW = c.preGuardDischargeW
-			} else {
-				c.currentDischargeW = c.preGuardDischargeW * (4 - c.dischargeGuardCount) / 4
-			}
-
-			slog.Info("night_resume_increase",
-				"import_w", grid.Total,
-				"guard_count", c.dischargeGuardCount,
-				"per_inv_w", c.currentDischargeW,
-				"total_w", c.currentDischargeW*4,
-			)
-
-			if err := c.writeDischargeRates(c.currentDischargeW); err != nil {
-				slog.Error("failed to resume discharge", "error", err)
-			}
-
-			c.highLoadSince = time.Time{} // reset for next step
-		}
-	} else {
-		// Load dropped — require 3 consecutive readings below threshold to reset timer
-		if !c.highLoadSince.IsZero() {
-			c.resumeBelowCount++
-			if c.resumeBelowCount >= 3 {
-				c.highLoadSince = time.Time{}
-				c.resumeBelowCount = 0
-			}
-		}
-	}
+// runNightReducedLogic is now handled by the ramp in runNightDischargeLogic.
+// If we end up here, transition back to NIGHT_DISCHARGE.
+func (c *Controller) runNightReducedLogic(_ wattnode.GridPower) {
+	slog.Info("night_reduced_to_discharge", "reason", "ramp handles export reduction")
+	c.state.Transition(StateNightDischarge, "ramp handles discharge adjustment")
 }
 
 // enterSafeMode transitions to safe mode
