@@ -997,19 +997,36 @@ func (c *Controller) stopDayDischarge() {
 	}
 }
 
-// startCharging begins charging — grabs all available export immediately
+// chargeExportShare returns the fraction of available energy to use for charging.
+// Tapers charge rate as batteries fill to spread export evenly across the day.
+//   0-50% SOC:  100% — charge as fast as possible
+//   50-75% SOC: 50%  — half to batteries, half to PG&E
+//   75-100% SOC: 25% — quarter to batteries, rest to PG&E
+// If SOC is unknown (0 = no BMS data yet), assume high and use 25%.
+func (c *Controller) chargeExportShare(totalW int) int {
+	soc := c.currentSOC()
+	if soc == 0 || soc > 75 {
+		return totalW / 4
+	}
+	if soc > 50 {
+		return totalW / 2
+	}
+	return totalW
+}
+
+// startCharging begins charging — grabs available export based on SOC
 func (c *Controller) startCharging() {
 	c.mu.RLock()
 	gridW := int(c.gridPower.Total)
 	c.mu.RUnlock()
 
-	// Take all available export, minimum StartPerInvW
 	exportW := 0
 	if gridW < 0 {
 		exportW = -gridW
 	}
 
-	newTotalW := min(exportW, c.cfg.MaxTotalW)
+	useW := c.chargeExportShare(exportW)
+	newTotalW := min(useW, c.cfg.MaxTotalW)
 	newChargeW := clamp(newTotalW/4, c.cfg.StartPerInvW, c.cfg.MaxPerInvW)
 
 	c.currentChargeW = newChargeW
@@ -1039,9 +1056,12 @@ func (c *Controller) rampUpCharge(gridW int) {
 	// Calculate export amount (gridW is negative when exporting)
 	exportW := -gridW
 
-	// Take all available export: new_total = current_total + export
+	// Total production = what we're already charging + what's still exporting
 	currentTotalW := c.currentChargeW * 4
-	newTotalW := min(currentTotalW+exportW, c.cfg.MaxTotalW)
+	totalProductionW := currentTotalW + exportW
+	// Above 50% SOC, only charge half of total production — rest goes to PG&E
+	targetW := c.chargeExportShare(totalProductionW)
+	newTotalW := min(targetW, c.cfg.MaxTotalW)
 	newChargeW := min(newTotalW/4, c.cfg.MaxPerInvW)
 
 	if newChargeW != c.currentChargeW {
@@ -1282,13 +1302,24 @@ func (c *Controller) isSunriseTransition() bool {
 	return hour >= c.scheduler.chargeStartHour-1 && hour < c.scheduler.chargeStartHour
 }
 
+// isSunsetGracePeriod returns true during the first 30 minutes of discharge window.
+// Solar may still be producing — skip export guard to avoid immediately idling
+// all inverters and bouncing back to DAY_CHARGE.
+func (c *Controller) isSunsetGracePeriod() bool {
+	now := time.Now()
+	dischargeStart := time.Date(now.Year(), now.Month(), now.Day(),
+		c.scheduler.chargeEndHour, 0, 0, 0, now.Location())
+	return now.After(dischargeStart) && now.Before(dischargeStart.Add(30*time.Minute))
+}
+
 
 // runNightDischargeLogic handles nighttime discharge monitoring
 func (c *Controller) runNightDischargeLogic(grid wattnode.GridPower) {
 	// Skip night guard during manual override in charge window — solar export is expected
-	if !c.manualOverride || !c.scheduler.IsChargeWindow() {
-		// During sunrise transition (hour before charge window), any net export
-		// means solar is producing — skip guard, go straight to DAY_CHARGE.
+	guardActive := !c.manualOverride || !c.scheduler.IsChargeWindow()
+
+	if guardActive {
+		// Sunrise: any export → transition to DAY_CHARGE immediately
 		if c.isSunriseTransition() && grid.Total < 0 {
 			slog.Info("sunrise_transition",
 				"l1_w", grid.L1,
@@ -1310,13 +1341,16 @@ func (c *Controller) runNightDischargeLogic(grid wattnode.GridPower) {
 			return
 		}
 
-		// Night guard: check net total power against threshold.
-		// PG&E meters net total across both legs, not per-leg.
-		threshold := c.effectiveExportThreshold()
-		if grid.Total < float32(-threshold) {
-			c.nightExportDetected(grid)
-			c.dischargeRampSince = time.Time{}
-			return
+		// Sunset grace: skip guard for 30 min after discharge window starts
+		// Solar still tapering — let small export pass without reducing inverters
+		if !c.isSunsetGracePeriod() {
+			// Night guard: check net total power against threshold.
+			threshold := c.effectiveExportThreshold()
+			if grid.Total < float32(-threshold) {
+				c.nightExportDetected(grid)
+				c.dischargeRampSince = time.Time{}
+				return
+			}
 		}
 	}
 
@@ -1467,8 +1501,10 @@ func (c *Controller) nightExportDetected(grid wattnode.GridPower) {
 // runNightReducedLogic monitors for continued export and reduces further if needed
 func (c *Controller) runNightReducedLogic(grid wattnode.GridPower) {
 	// Skip night guard during manual override in charge window — solar export is expected
-	if !c.manualOverride || !c.scheduler.IsChargeWindow() {
-		// During sunrise, any export = transition to DAY_CHARGE immediately
+	guardActive := !c.manualOverride || !c.scheduler.IsChargeWindow()
+
+	if guardActive {
+		// Sunrise: any export → transition to DAY_CHARGE immediately
 		if c.isSunriseTransition() && grid.Total < 0 {
 			slog.Info("sunrise_transition_from_reduced",
 				"total_w", grid.Total,
@@ -1489,14 +1525,15 @@ func (c *Controller) runNightReducedLogic(grid wattnode.GridPower) {
 			return
 		}
 
-		// Still monitoring for export — if export returns, reduce further
-		// PG&E meters net total across both legs, not per-leg.
-		threshold := c.effectiveExportThreshold()
-		if grid.Total < float32(-threshold) {
-			c.nightExportDetected(grid)
-			c.highLoadSince = time.Time{}
-			c.resumeBelowCount = 0
-			return
+		// Sunset grace: skip guard for 30 min after discharge window starts
+		if !c.isSunsetGracePeriod() {
+			threshold := c.effectiveExportThreshold()
+			if grid.Total < float32(-threshold) {
+				c.nightExportDetected(grid)
+				c.highLoadSince = time.Time{}
+				c.resumeBelowCount = 0
+				return
+			}
 		}
 	}
 
