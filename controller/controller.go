@@ -925,29 +925,27 @@ func (c *Controller) runDayChargeLogic(grid wattnode.GridPower) {
 		c.rampDownCharge(gridW)
 	}
 
-	// Starvation check: at floor with export < 500W for 20 min → idle all
-	const starvationExportW = 500
-	const starvationTimeout = 20 * time.Minute
-	atFloor := c.currentChargeW > 0 && c.currentChargeW <= c.cfg.StartPerInvW
-	lowPower := exportW < starvationExportW
+	// Stop charging if importing > 500W for 10 min — not enough solar to justify charging.
+	const importStopW = 500
+	const importStopDur = 10 * time.Minute
 
-	if atFloor && lowPower {
+	if c.currentChargeW > 0 && gridW > importStopW {
 		if c.starvationAt.IsZero() {
 			c.starvationAt = time.Now()
-			slog.Info("starvation_timer_started",
+			slog.Info("charge_import_timer_started",
+				"import_w", gridW,
 				"charge_w", c.currentChargeW,
-				"export_w", exportW,
 			)
-		} else if time.Since(c.starvationAt) >= starvationTimeout {
-			slog.Info("starvation_idle",
+		} else if time.Since(c.starvationAt) >= importStopDur {
+			slog.Info("charge_stopped_importing",
+				"import_w", gridW,
 				"duration", time.Since(c.starvationAt),
-				"export_w", exportW,
 			)
 			c.currentChargeW = 0
 			c.waitingForExport = true
 			c.starvationAt = time.Time{}
 			if err := c.insight.IdleAllInverters(c.cfg.AllUnitIDs()); err != nil {
-				slog.Error("failed to idle inverters on starvation", "error", err)
+				slog.Error("failed to idle inverters", "error", err)
 			}
 		}
 	} else {
@@ -993,21 +991,30 @@ func (c *Controller) stopDayDischarge() {
 	}
 }
 
-// chargeExportShare returns the fraction of available energy to use for charging.
-// Tapers charge rate as batteries fill to spread export evenly across the day.
-//   0-50% SOC:  100% — charge as fast as possible
-//   50-75% SOC: 50%  — half to batteries, half to PG&E
-//   75-100% SOC: 25% — quarter to batteries, rest to PG&E
-// If SOC is unknown (0 = no BMS data yet), assume high and use 25%.
-func (c *Controller) chargeExportShare(totalW int) int {
+// chargeTarget calculates how much to charge from total production.
+// Two constraints, whichever demands more charging wins:
+//   1. Export cap: keep visible export below 10kW (charge the excess)
+//   2. SOC taper: spread charging across the day so batteries don't fill early
+//      0-50% SOC: 100%, 50-75%: 50%, 75-100%: 25%
+const maxExportW = 10000
+
+func (c *Controller) chargeTarget(totalProductionW int) int {
+	// Minimum charge to keep export under 10kW
+	exportCapW := max(totalProductionW-maxExportW, 0)
+
+	// SOC-based taper to spread charge across the day
 	soc := c.currentSOC()
+	var socShareW int
 	if soc == 0 || soc > 75 {
-		return totalW / 4
+		socShareW = totalProductionW / 4
+	} else if soc > 50 {
+		socShareW = totalProductionW / 2
+	} else {
+		socShareW = totalProductionW
 	}
-	if soc > 50 {
-		return totalW / 2
-	}
-	return totalW
+
+	// Use whichever is higher
+	return max(exportCapW, socShareW)
 }
 
 // startCharging begins charging — grabs available export based on SOC
@@ -1021,7 +1028,7 @@ func (c *Controller) startCharging() {
 		exportW = -gridW
 	}
 
-	useW := c.chargeExportShare(exportW)
+	useW := c.chargeTarget(exportW)
 	newTotalW := min(useW, c.cfg.MaxTotalW)
 	newChargeW := clamp(newTotalW/4, c.cfg.StartPerInvW, c.cfg.MaxPerInvW)
 
@@ -1056,7 +1063,7 @@ func (c *Controller) rampUpCharge(gridW int) {
 	currentTotalW := c.currentChargeW * 4
 	totalProductionW := currentTotalW + exportW
 	// Above 50% SOC, only charge half of total production — rest goes to PG&E
-	targetW := c.chargeExportShare(totalProductionW)
+	targetW := c.chargeTarget(totalProductionW)
 	newTotalW := min(targetW, c.cfg.MaxTotalW)
 	newChargeW := min(newTotalW/4, c.cfg.MaxPerInvW)
 
