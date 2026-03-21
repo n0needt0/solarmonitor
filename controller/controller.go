@@ -416,7 +416,7 @@ func (c *Controller) checkEPCStuck() {
 	bmsAge := time.Since(c.lastBMSAt)
 	c.mu.RUnlock()
 
-	if bms == nil || bmsAge > 2*time.Minute {
+	if bms == nil || bmsAge > 5*time.Minute {
 		return
 	}
 
@@ -1278,34 +1278,11 @@ func (c *Controller) writeChargeKeepalive(perInvW int) error {
 	return firstErr
 }
 
-// effectiveExportThreshold returns the net export threshold based on time of day.
-// PG&E meters net total across both legs — per-leg monitoring is unnecessary.
-func (c *Controller) effectiveExportThreshold() int {
+// exportAllowed returns true during 8am-6pm when PG&E export credits are good.
+// Outside this window, export must be prevented.
+func (c *Controller) exportAllowed() bool {
 	hour := time.Now().Hour()
-	if hour >= 7 && hour < 17 {
-		// Solar hours: tolerate 500W export — solar is producing,
-		// small net export is normal and not worth reducing discharge for.
-		return 500
-	}
-	return c.cfg.LegExportThresholdW
-}
-
-// isSunriseTransition returns true if we're in the hour before charge window
-// and solar is starting to produce. Used to skip guard reductions and transition
-// directly to DAY_CHARGE.
-func (c *Controller) isSunriseTransition() bool {
-	hour := time.Now().Hour()
-	return hour >= c.scheduler.chargeStartHour-1 && hour < c.scheduler.chargeStartHour
-}
-
-// isSunsetGracePeriod returns true during the first 30 minutes of discharge window.
-// Solar may still be producing — skip export guard to avoid immediately idling
-// all inverters and bouncing back to DAY_CHARGE.
-func (c *Controller) isSunsetGracePeriod() bool {
-	now := time.Now()
-	dischargeStart := time.Date(now.Year(), now.Month(), now.Day(),
-		c.scheduler.chargeEndHour, 0, 0, 0, now.Location())
-	return now.After(dischargeStart) && now.Before(dischargeStart.Add(30*time.Minute))
+	return hour >= 8 && hour < 18
 }
 
 
@@ -1315,56 +1292,30 @@ func (c *Controller) runNightDischargeLogic(grid wattnode.GridPower) {
 	guardActive := !c.manualOverride || !c.scheduler.IsChargeWindow()
 
 	if guardActive {
-		// Sunrise: any export → transition to DAY_CHARGE immediately
-		if c.isSunriseTransition() && grid.Total < 0 {
-			slog.Info("sunrise_transition",
-				"l1_w", grid.L1,
-				"l2_w", grid.L2,
+		// During 8am-6pm, export is allowed — skip guard
+		if !c.exportAllowed() && grid.Total < float32(-c.cfg.LegExportThresholdW) {
+			// Outside 8am-6pm: any export → immediate ramp down
+			exportW := int(-grid.Total)
+			step := clamp(exportW/4, 50, 300)
+			newW := max(c.currentDischargeW-step, 0)
+			slog.Warn("export_guard_ramp_down",
 				"total_w", grid.Total,
+				"from_per_inv_w", c.currentDischargeW,
+				"to_per_inv_w", newW,
+				"step", step,
 			)
-			c.currentDischargeW = 0
-			if err := c.insight.IdleAllInverters(c.cfg.AllUnitIDs()); err != nil {
-				slog.Error("failed to idle on sunrise", "error", err)
-			}
-			soc := c.currentSOC()
-			c.stats.StartSession(SessionCharge, soc)
-			c.state.Transition(StateDayCharge, "sunrise — solar export detected")
-			c.manualOverride = true
-			c.manualOverrideInDay = false
-			if err := c.applyCurrentState(); err != nil {
-				slog.Error("failed to apply day charge", "error", err)
-			}
-			return
-		}
-
-		// Sunset grace: skip guard for 30 min after discharge window starts
-		// Solar still tapering — let small export pass
-		if !c.isSunsetGracePeriod() {
-			// Export detected — immediate ramp down (no state change, no idling)
-			threshold := c.effectiveExportThreshold()
-			if grid.Total < float32(-threshold) {
-				exportW := int(-grid.Total)
-				step := clamp(exportW/4, 50, 300)
-				newW := max(c.currentDischargeW-step, 0)
-				slog.Warn("night_export_ramp_down",
-					"total_w", grid.Total,
-					"from_per_inv_w", c.currentDischargeW,
-					"to_per_inv_w", newW,
-					"step", step,
-				)
-				c.currentDischargeW = newW
-				if newW == 0 {
-					if err := c.insight.IdleAllInverters(c.cfg.AllUnitIDs()); err != nil {
-						slog.Error("idle all failed", "error", err)
-					}
-				} else {
-					if err := c.writeDischargeRates(newW); err != nil {
-						slog.Error("export ramp down failed", "error", err)
-					}
+			c.currentDischargeW = newW
+			if newW == 0 {
+				if err := c.insight.IdleAllInverters(c.cfg.AllUnitIDs()); err != nil {
+					slog.Error("idle all failed", "error", err)
 				}
-				c.lastDischargeAdjust = time.Now()
-				return
+			} else {
+				if err := c.writeDischargeRates(newW); err != nil {
+					slog.Error("export ramp down failed", "error", err)
+				}
 			}
+			c.lastDischargeAdjust = time.Now()
+			return
 		}
 	}
 
