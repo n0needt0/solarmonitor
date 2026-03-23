@@ -65,6 +65,8 @@ type Controller struct {
 	currentDischargeW   int       // Current discharge rate per inverter
 	dischargeRampSince  time.Time // When we first saw high import for discharge ramp
 	lastDischargeAdjust time.Time // Last time we adjusted discharge rate
+	exportGuardCap      int       // Max rate after export guard fires (0 = no cap)
+	exportGuardUntil    time.Time // When the cap expires
 
 	// Session statistics
 	stats *StatsTracker
@@ -389,7 +391,7 @@ func (c *Controller) resetEPCStuck() {
 func (c *Controller) checkEPCStuck() {
 	state := c.state.Current()
 
-	// Only check in active charge/discharge states with a commanded rate
+	// Determine commanded rate from current state
 	var commandedRate int
 	switch state {
 	case StateDayCharge:
@@ -401,13 +403,11 @@ func (c *Controller) checkEPCStuck() {
 	case StateNightDischarge, StateNightReduced:
 		commandedRate = c.currentDischargeW
 	default:
-		c.resetEPCStuck()
-		return
+		return // not in an active state, skip check (don't reset timer)
 	}
 
 	if commandedRate == 0 {
-		c.resetEPCStuck()
-		return
+		return // no command active, skip check (don't reset timer)
 	}
 
 	// Check BMS power
@@ -1312,6 +1312,9 @@ func (c *Controller) runNightDischargeLogic(grid wattnode.GridPower) {
 				"step", step,
 			)
 			c.currentDischargeW = newW
+			// Cap the ramp at this rate for 5 minutes to prevent oscillation
+			c.exportGuardCap = newW
+			c.exportGuardUntil = time.Now().Add(5 * time.Minute)
 			if newW == 0 {
 				if err := c.insight.IdleAllInverters(c.cfg.AllUnitIDs()); err != nil {
 					slog.Error("idle all failed", "error", err)
@@ -1341,12 +1344,20 @@ func (c *Controller) runNightDischargeLogic(grid wattnode.GridPower) {
 
 	importW := int(grid.Total)
 
-	if importW > importCeil && c.currentDischargeW < c.cfg.MaxDischargePerInvW {
+	// Respect export guard cap — don't ramp above the guard-reduced rate until cooldown expires
+	maxW := c.cfg.MaxDischargePerInvW
+	if c.exportGuardCap > 0 && time.Now().Before(c.exportGuardUntil) {
+		maxW = c.exportGuardCap
+	} else {
+		c.exportGuardCap = 0
+	}
+
+	if importW > importCeil && c.currentDischargeW < maxW {
 		// Importing too much — ramp up discharge
 		// Step scales with overshoot: (import - target) / 4 inverters
 		headroom := (importW - importCeil) / 4
 		step := clamp(headroom, minStep, maxStep)
-		newW := min(c.currentDischargeW+step, c.cfg.MaxDischargePerInvW)
+		newW := min(c.currentDischargeW+step, maxW)
 		slog.Info("discharge_ramp_up",
 			"import_w", importW,
 			"from_per_inv_w", c.currentDischargeW,
