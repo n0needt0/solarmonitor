@@ -23,8 +23,8 @@ charge:
   start_hour: 9
   end_hour: 17
   start_per_inverter_w: 600
-  max_per_inverter_w: 4000
-  max_total_w: 16000
+  max_per_inverter_w: 3000   # 3kW/inv: inverters 13+14 share 60A subpanel with 32A Tesla charger
+  max_total_w: 12000         # 3000 * 4 inverters
   export_start_w: 1000
   ramp_up_hold_sec: 30
   ramp_down_hold_sec: 300
