@@ -105,7 +105,8 @@ func isConnectionError(err error) bool {
 		strings.Contains(errStr, "connection refused") ||
 		strings.Contains(errStr, "i/o timeout") ||
 		strings.Contains(errStr, "no route to host") ||
-		strings.Contains(errStr, "operation timed out")
+		strings.Contains(errStr, "operation timed out") ||
+		strings.Contains(errStr, "does not match request")
 }
 
 // IsModbusException3 returns true if err is a Modbus exception 3 (illegal data value).

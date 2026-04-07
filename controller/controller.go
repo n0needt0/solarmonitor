@@ -51,6 +51,7 @@ type Controller struct {
 	lastCycleAt          time.Time // Last inverter standby cycle attempt
 	epcStuckSince        time.Time // When we first detected EPC stuck (writes OK but BMS power 0)
 	epcCycleCount        int       // Consecutive standby cycles that failed to unstick EPC
+	lastStuckBlindLog    time.Time // Throttle for "stuck check blind" warnings
 
 	// Day peak shave tracking
 	dayDischargeSince time.Time // When sustained high import started during day
@@ -417,6 +418,20 @@ func (c *Controller) checkEPCStuck() {
 	c.mu.RUnlock()
 
 	if bms == nil || bmsAge > 5*time.Minute {
+		// Stuck detection is blind without fresh BMS data. Surface this so
+		// we don't silently lose visibility for hours.
+		if time.Since(c.lastStuckBlindLog) > time.Minute {
+			slog.Warn("epc_stuck_check_blind",
+				"reason", func() string {
+					if bms == nil {
+						return "no_bms_data"
+					}
+					return "bms_stale"
+				}(),
+				"bms_age", bmsAge.Round(time.Second),
+			)
+			c.lastStuckBlindLog = time.Now()
+		}
 		return
 	}
 
@@ -493,26 +508,70 @@ func (c *Controller) checkEPCStuck() {
 
 	c.epcCycleCount++
 	c.lastCycleAt = now
+	attempt := c.epcCycleCount
 
 	slog.Warn("epc_stuck_recovering",
-		"attempt", c.epcCycleCount,
+		"attempt", attempt,
 		"max", maxAttempts,
 		"stuck_for", stuckDuration,
 		"commanded_w", commandedRate,
 		"bms_power", absPower,
 	)
+
+	// Attempt 1: cheapest fix — try clearing alerts (battery overvoltage,
+	// fault state, etc.). Today's failure mode was inverters sitting in a
+	// fault state that no amount of standby cycling or gateway rebooting
+	// could dig out of. Clearing alerts is non-disruptive when there are
+	// none to clear (returns result code 2).
+	//
+	// Attempt 2+: clear alerts THEN gateway reboot, since the alert may
+	// have come back or the gateway itself is in a bad state.
 	if c.alerter != nil {
-		c.alerter.SendFailureAlert(fmt.Sprintf(
-			"EPC stuck (attempt %d/%d) — BMS %dW, commanded %dW/inv. Running stop → reboot → start.",
-			c.epcCycleCount, maxAttempts, absPower, commandedRate,
-		))
+		if attempt == 1 {
+			c.alerter.SendFailureAlert(fmt.Sprintf(
+				"EPC stuck (attempt %d/%d) — BMS %dW, commanded %dW/inv. Clearing alerts.",
+				attempt, maxAttempts, absPower, commandedRate,
+			))
+		} else {
+			c.alerter.SendFailureAlert(fmt.Sprintf(
+				"EPC stuck (attempt %d/%d) — BMS %dW, commanded %dW/inv. Clear alerts → reboot → restart.",
+				attempt, maxAttempts, absPower, commandedRate,
+			))
+		}
 	}
 
-	// Step 1: Stop — idle all inverters
+	// Step A: Clear alerts on all devices (every attempt)
+	slog.Info("epc_recovery_clear_alerts")
+	clearCtx, clearCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	xwCleared, clearErr := c.rebooter.ClearAlerts(clearCtx)
+	clearCancel()
+	if clearErr != nil {
+		slog.Error("epc_recovery_clear_alerts_failed", "error", clearErr)
+	} else {
+		slog.Info("epc_recovery_clear_alerts_done", "xw_with_alerts", xwCleared)
+		if xwCleared > 0 && c.alerter != nil {
+			c.alerter.SendFailureAlert(fmt.Sprintf(
+				"Cleared alerts on %d inverter(s) — investigate root cause.",
+				xwCleared,
+			))
+		}
+	}
+
+	// Attempt 1 stops here. Give the inverters ~30s to start producing
+	// power again, then let the stuck check decide on the next pass.
+	if attempt == 1 {
+		time.Sleep(30 * time.Second)
+		// Don't reset cycleCount — if it's still stuck, attempt 2 fires.
+		// Don't reset stuckSince either — checkEPCStuck will reset it
+		// naturally if BMS power recovers.
+		return
+	}
+
+	// Step B: Stop — idle all inverters
 	slog.Info("epc_recovery_stop")
 	c.insight.IdleAllInverters(c.cfg.AllUnitIDs())
 
-	// Step 2: Reboot gateway
+	// Step C: Reboot gateway
 	slog.Info("epc_recovery_reboot")
 	rebootCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	err := c.rebooter.Reboot(rebootCtx)
@@ -521,20 +580,22 @@ func (c *Controller) checkEPCStuck() {
 
 	if err != nil {
 		slog.Error("epc_recovery_reboot_failed", "error", err)
-		// Still try to restart — gateway might come back
 	} else {
-		slog.Info("epc_recovery_reboot_sent", "waiting", "90s")
+		slog.Info("epc_recovery_reboot_sent", "waiting", "3m")
 	}
 
-	// Step 3: Wait for gateway to come back
-	time.Sleep(90 * time.Second)
+	// Step D: Wait for gateway to come back. 90s is not enough — port 502
+	// reopens but Xanbus is still re-enumerating inverters and writes to
+	// individual units time out for the first ~2 minutes. Match the SAFE-mode
+	// recovery wait of 3 minutes.
+	time.Sleep(3 * time.Minute)
 
-	// Step 4: Stop again (clean slate after reboot)
+	// Step E: Stop again (clean slate after reboot)
 	slog.Info("epc_recovery_stop_after_reboot")
 	c.insight.IdleAllInverters(c.cfg.AllUnitIDs())
 	time.Sleep(5 * time.Second)
 
-	// Step 5: Start — re-enter current state
+	// Step F: Start — re-enter current state
 	slog.Info("epc_recovery_start")
 	if err := c.applyCurrentState(); err != nil {
 		slog.Error("epc_recovery_apply_failed", "error", err)
@@ -543,7 +604,7 @@ func (c *Controller) checkEPCStuck() {
 	c.resetEPCStuck()
 
 	if c.alerter != nil {
-		c.alerter.SendRecoveryAlert("EPC recovery complete (stop → reboot → start)")
+		c.alerter.SendRecoveryAlert("EPC recovery complete (clear → reboot → restart)")
 	}
 }
 

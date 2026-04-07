@@ -223,6 +223,29 @@ func (h *TelegramHandler) HandleCycle() string {
 	return "Cycling all inverters standby → operating... (~15s)"
 }
 
+// HandleClear clears warnings and faults on all inverters, BMS units, and WattNode.
+// Mirrors the "Clear All" button in the Insight web UI.
+func (h *TelegramHandler) HandleClear() string {
+	if h.ctrl.rebooter == nil {
+		return "Gateway rebooter not configured"
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		cleared, err := h.ctrl.rebooter.ClearAlerts(ctx)
+		if err != nil {
+			slog.Error("manual clear alerts failed", "error", err)
+			h.bot.SendMessage("Clear alerts failed: " + err.Error())
+			return
+		}
+		slog.Info("manual clear alerts completed", "xw_with_alerts", cleared)
+		h.bot.SendMessage(fmt.Sprintf("Cleared alerts on %d inverter(s)", cleared))
+	}()
+
+	return "Clearing alerts on all devices..."
+}
+
 // HandleStats returns session statistics
 func (h *TelegramHandler) HandleStats() string {
 	var current, lastCharge, lastDischarge *telegram.SessionStatsData

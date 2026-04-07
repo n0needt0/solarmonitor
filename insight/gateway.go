@@ -196,6 +196,167 @@ func (g *GatewayRebooter) CycleInverters(ctx context.Context) error {
 	return nil
 }
 
+// clearAlertsRequest is the JSON body shape for /setparams.
+type clearAlertsRequest struct {
+	Values []clearAlertsEntry `json:"values"`
+}
+
+type clearAlertsEntry struct {
+	Name  string `json:"name"`
+	Value int    `json:"value"`
+}
+
+type setparamsResponse struct {
+	Values []struct {
+		Name   string `json:"name"`
+		Result int    `json:"result"`
+	} `json:"values"`
+	OTK string `json:"OTK"`
+}
+
+// ClearAlerts clears warnings and faults on all XW inverters, BMS units, and the
+// WattNode device — same action as the "Clear All" button in the Insight web UI.
+//
+// For each device, two writes are issued (CFG_CLEAR=2 then =8) followed by a
+// /SCB/CFG/APPLY=1 commit. Returns the number of XW devices that actually had
+// alerts present (result code 0). Devices with no fault return code 2.
+func (g *GatewayRebooter) ClearAlerts(ctx context.Context) (xwCleared int, err error) {
+	baseURL := fmt.Sprintf("https://%s", g.host)
+
+	session, err := g.login(ctx, "clear_alerts")
+	if err != nil {
+		return 0, err
+	}
+
+	// Step 2: Get DEVLIST → collect XW + BMS + WATTNODE instances
+	devResp, err := g.postAPI(ctx, baseURL+"/vars", "name=DEVLIST", session, "")
+	if err != nil {
+		return 0, fmt.Errorf("get DEVLIST: %w", err)
+	}
+
+	var devList devListResponse
+	if err := json.Unmarshal([]byte(devResp), &devList); err != nil {
+		return 0, fmt.Errorf("parse DEVLIST: %w (body: %.200s)", err, devResp)
+	}
+
+	var xwInstances, bmsInstances, wnInstances []int
+	if len(devList.Values) > 0 {
+		for _, dev := range devList.Values[0].Value {
+			if dev.IsActive != "true" {
+				continue
+			}
+			switch dev.Name {
+			case "XW":
+				if dev.Attributes["interface"] == "xanbus" {
+					xwInstances = append(xwInstances, dev.Instance)
+				}
+			case "BMS":
+				bmsInstances = append(bmsInstances, dev.Instance)
+			case "WATTNODE":
+				wnInstances = append(wnInstances, dev.Instance)
+			}
+		}
+	}
+	otk := devList.OTK
+
+	slog.Info("clear_alerts_devices",
+		"xw", len(xwInstances),
+		"bms", len(bmsInstances),
+		"wattnode", len(wnInstances),
+	)
+
+	// Step 3: Build the batch payload (mirrors what the web UI sends)
+	var values []clearAlertsEntry
+	addPair := func(prefix string, inst int, suffix string) {
+		name := fmt.Sprintf("[%d]/%s/%s", inst, prefix, suffix)
+		values = append(values,
+			clearAlertsEntry{Name: name, Value: 2},
+			clearAlertsEntry{Name: name, Value: 8},
+		)
+	}
+	for _, inst := range wnInstances {
+		addPair("WATTNODE/DEV", inst, "CFG_CLEAR")
+	}
+	for _, inst := range xwInstances {
+		addPair("XW/DEV", inst, "CFG_CLEAR")
+	}
+	for _, inst := range bmsInstances {
+		addPair("BMS/DEV", inst, "CFG_CLEAR")
+	}
+	values = append(values, clearAlertsEntry{Name: "/SCB/CFG/APPLY", Value: 1})
+
+	if len(values) == 1 {
+		return 0, fmt.Errorf("no devices found to clear")
+	}
+
+	body, err := json.Marshal(clearAlertsRequest{Values: values})
+	if err != nil {
+		return 0, fmt.Errorf("marshal setparams: %w", err)
+	}
+
+	// Step 4: POST /setparams (JSON, not form-encoded like /set)
+	respBody, err := g.postJSON(ctx, baseURL+"/setparams", body, session, otk)
+	if err != nil {
+		return 0, fmt.Errorf("setparams: %w", err)
+	}
+
+	var resp setparamsResponse
+	if err := json.Unmarshal([]byte(respBody), &resp); err != nil {
+		return 0, fmt.Errorf("parse setparams response: %w (body: %.200s)", err, respBody)
+	}
+
+	// Count XW entries with result 0 (something was actually cleared).
+	// Each XW has two entries (=2 then =8); divide by 2.
+	xwHits := 0
+	for _, v := range resp.Values {
+		if !strings.Contains(v.Name, "/XW/DEV/CFG_CLEAR") {
+			continue
+		}
+		if v.Result == 0 {
+			xwHits++
+		}
+	}
+	xwCleared = xwHits / 2
+
+	slog.Info("clear_alerts_complete",
+		"xw_with_alerts", xwCleared,
+		"xw_total", len(xwInstances),
+	)
+	return xwCleared, nil
+}
+
+// postJSON sends a POST request to the gateway API with a JSON body.
+// Unlike postAPI (which uses text/plain for the form-encoded /set endpoint),
+// /setparams expects application/json.
+func (g *GatewayRebooter) postJSON(ctx context.Context, url string, body []byte, authToken, otk string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(string(body)))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "text/plain;charset=utf-8")
+	if authToken != "" {
+		req.Header.Set("authToken", authToken)
+	}
+	if otk != "" {
+		req.Header.Set("otk", otk)
+	}
+
+	resp, err := g.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+	return string(respBody), nil
+}
+
 // postAPI sends a POST request to the gateway API.
 func (g *GatewayRebooter) postAPI(ctx context.Context, url, body, authToken, otk string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(body))

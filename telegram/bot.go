@@ -44,6 +44,7 @@ type CommandHandler interface {
 	HandleDischarge() string
 	HandleReboot() string
 	HandleCycle() string
+	HandleClear() string
 }
 
 // Update represents a Telegram update
@@ -227,6 +228,8 @@ func (b *Bot) handleUpdate(update Update) {
 		response = b.handler.HandleReboot()
 	case "/cycle":
 		response = b.handler.HandleCycle()
+	case "/clear":
+		response = b.handler.HandleClear()
 	case "/help":
 		response = FormatHelp()
 	default:
