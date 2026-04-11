@@ -442,7 +442,7 @@ func (c *Controller) checkEPCStuck() {
 		c.resetEPCStuck()
 		return
 	}
-	if !isCharging && avgSOC <= 5 {
+	if !isCharging && avgSOC <= 20 {
 		c.resetEPCStuck()
 		return
 	}
@@ -1356,6 +1356,33 @@ func (c *Controller) exportAllowed() bool {
 
 // runNightDischargeLogic handles nighttime discharge monitoring
 func (c *Controller) runNightDischargeLogic(grid wattnode.GridPower) {
+	// Low SOC protection: stop discharging when batteries are depleted.
+	// BMS will refuse to discharge anyway, but the controller would keep
+	// commanding power → detect EPC stuck → reboot gateway in a loop.
+	const minDischargeSOC = 20
+	c.mu.RLock()
+	bms := c.bmsStatus
+	c.mu.RUnlock()
+	if bms != nil {
+		soc := bms.TotalSOC()
+		if soc > 0 && soc < minDischargeSOC {
+			slog.Warn("discharge_stopped_low_soc",
+				"soc", soc,
+				"min", minDischargeSOC,
+			)
+			if err := c.insight.IdleAllInverters(c.cfg.AllUnitIDs()); err != nil {
+				slog.Error("idle all failed on low SOC", "error", err)
+			}
+			c.currentDischargeW = 0
+			c.resetEPCStuck()
+			c.state.Transition(StateStopped, fmt.Sprintf("SOC %d%% below %d%% minimum", soc, minDischargeSOC))
+			if c.alerter != nil {
+				c.alerter.SendFailureAlert(fmt.Sprintf("Discharge stopped — SOC %d%% below %d%% minimum. Batteries depleted.", soc, minDischargeSOC))
+			}
+			return
+		}
+	}
+
 	// Skip night guard during manual override in charge window — solar export is expected
 	guardActive := !c.manualOverride || !c.scheduler.IsChargeWindow()
 
